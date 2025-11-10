@@ -11,7 +11,7 @@ echo "Secondary host: ${SECONDARY_HOST}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ $# < 1 ]]; then
+if [[ $# -lt 1 ]]; then
   echo "Usage: $0 MODEL" >&2
   echo "  MODEL - Hugging Face model id, e.g. nvidia/Qwen3-14B-FP4" >&2
   exit 1

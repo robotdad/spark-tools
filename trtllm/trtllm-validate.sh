@@ -86,6 +86,8 @@ echo "Checking http://localhost:$PORT/v1/chat/completions..."
 echo
 
 HTTP_ERR_FILE="$(mktemp)"
+# Ensure temp file is cleaned up on exit
+trap 'rm -f "$HTTP_ERR_FILE"' EXIT
 
 set +e
 HTTP_RESPONSE=$(curl -sS -m 30 \
@@ -101,10 +103,8 @@ if [[ $CURL_STATUS -ne 0 ]]; then
   echo "❌ HTTP request failed (curl exit code: $CURL_STATUS)"
   echo "Error output:"
   cat "$HTTP_ERR_FILE"
-  rm -f "$HTTP_ERR_FILE"
   exit 1
 fi
-rm -f "$HTTP_ERR_FILE"
 
 # Split body vs HTTP code
 HTTP_CODE="$(echo "$HTTP_RESPONSE" | awk -F: '/^HTTP_CODE:/ {print $2}' | tr -d ' \r')"

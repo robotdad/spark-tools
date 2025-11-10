@@ -93,7 +93,9 @@ echo "Total tokens:   $total_tokens"
 if [[ "$effective_runs" -gt 0 ]]; then
   avg_lat="$(awk -v tt="$total_time" -v n="$effective_runs" 'BEGIN { if (n > 0) print tt / n; else print 0 }')"
 
-  if [[ "$total_tokens" -gt 0 && "$(echo "$total_time > 0" | bc 2>/dev/null || echo 0)" -eq 1 ]]; then
+  # Check if total_time > 0 using awk instead of bc
+  time_positive="$(awk -v tt="$total_time" 'BEGIN { print (tt > 0) ? 1 : 0 }')"
+  if [[ "$total_tokens" -gt 0 && "$time_positive" -eq 1 ]]; then
     avg_tokps="$(awk -v t="$total_tokens" -v tt="$total_time" 'BEGIN { if (tt > 0) print t / tt; else print 0 }')"
   else
     avg_tokps="0.0"
