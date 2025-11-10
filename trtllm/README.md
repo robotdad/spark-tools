@@ -1,464 +1,512 @@
-# trtllm scripts
+# TensorRT-LLM for DGX Spark
 
-Helpers for running TensorRT-LLM in multi-node mode on a two-node DGX Spark cluster using Docker Swarm, **and** for poking at models on a single node.
+Scripts for running TensorRT-LLM inference on DGX Spark - both **single-node** and **cluster** (two-node) setups.
 
-The goal is to make it **much harder** to screw up things like:
-
-- “Did I download the model on both nodes?”
-- “Is the swarm actually healthy?”
-- “Is the model serving and answering requests?”
-- “How much GPU memory is this thing using?”
-- “Will this long HF download die when my SSH session drops?”
-
-…and to give me a repeatable “new model” workflow instead of a giant pile of copy-pasted commands.
+**What these scripts solve:**
+- Background model downloads that survive SSH disconnects
+- Automated cluster-wide downloads
+- Pre-flight validation before serving
+- Easy health checks (GPU memory, endpoint validation, benchmarking)
+- Graceful stop/cleanup without memorizing Docker commands
 
 ---
 
-## Host / environment assumptions
+## Quick Start Workflows
 
-These scripts are written around a two-node Spark setup but are configurable.
+### Single-Node Workflow
 
-### Host naming
-
-On each node, the scripts compute:
-
-- `PRIMARY_HOST` – defaults to `$(hostname)`  
-  Override with:  
-  ```bash
-  export SPARK_PRIMARY_HOST=<your-primary-host>
-  ```
-- `SECONDARY_HOST` – defaults to `dyad`  
-  Override with:  
-  ```bash
-  export SPARK_SECONDARY_HOST=<your-secondary-host>
-  ```
-
-In my setup:
-
-- Primary: `monad` (Swarm manager)
-- Secondary: `dyad` (Swarm worker)
-
-### Script layout / PATH
-
-I keep everything here **on both nodes**:
+**One DGX Spark, serving models locally (TP_SIZE=1)**
 
 ```bash
-~/spark-tools/trtllm
+# 1. Setup (once)
+export HF_TOKEN=hf_...
+export PATH="$HOME/spark-tools/trtllm:$PATH"
+
+# 2. Download model
+trtllm-download.sh download nvidia/Qwen3-14B-FP4
+
+# 3. Check download progress
+trtllm-download.sh status nvidia/Qwen3-14B-FP4
+
+# 4. Start serving (once download complete)
+trtllm-serve.sh nvidia/Qwen3-14B-FP4 8355 1
+
+# 5. Validate and benchmark
+trtllm-validate.sh nvidia/Qwen3-14B-FP4 8355
+trtllm-bench.sh nvidia/Qwen3-14B-FP4 8355
+
+# 6. Stop when done
+trtllm-stop.sh
 ```
 
-Recommended: add to your `PATH` (on both nodes):
+### Cluster Workflow (Two Sparks)
+
+**Two DGX Sparks connected via QSFP, tensor parallel across both (TP_SIZE=2)**
+
+```bash
+# 1. Setup on BOTH nodes (once, or in .bashrc)
+export HF_TOKEN=hf_...
+export PATH="$HOME/spark-tools/trtllm:$PATH"
+export SPARK_PRIMARY_HOST=monad      # your manager node
+export SPARK_SECONDARY_HOST=dyad     # your worker node
+
+# 2. Download model on BOTH nodes (run from primary)
+trtllm-new-model.sh nvidia/Qwen3-235B-A22B-FP4 8355 2
+
+# 3. Monitor download status on both nodes
+trtllm-model-status.sh nvidia/Qwen3-235B-A22B-FP4
+
+# 4. Start serving (once both show "Incomplete files: 0")
+trtllm-serve.sh nvidia/Qwen3-235B-A22B-FP4 8355 2
+
+# 5. Validate across cluster
+trtllm-validate.sh nvidia/Qwen3-235B-A22B-FP4 8355
+trtllm-bench.sh nvidia/Qwen3-235B-A22B-FP4 8355
+
+# 6. Stop when done
+trtllm-stop.sh --stack
+```
+
+---
+
+## Prerequisites
+
+### Hardware Requirements
+
+**Single-node:** 1x DGX Spark
+- 128 GB unified memory
+- Supports models up to ~200B parameters
+
+**Cluster:** 2x DGX Spark
+- Connected via QSFP cables (ConnectX-7 ports)
+- Supports models up to 405B parameters
+- Both nodes must be on same network segment
+
+### Software Prerequisites
+
+**On ALL nodes:**
+
+1. **Docker** with NVIDIA Container Toolkit
+   ```bash
+   # Verify Docker is running
+   docker ps
+   
+   # Verify NVIDIA Container Toolkit
+   docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+   ```
+
+2. **NVIDIA drivers**
+   ```bash
+   nvidia-smi
+   # Should show GPU info
+   ```
+
+3. **TRT-LLM container deployed**
+   - For cluster: Docker Swarm must be initialized and TRT-LLM stack deployed
+   - Stack name: `trtllm-multinode` (or configure scripts)
+   - See [NVIDIA Stacked Sparks docs](https://build.nvidia.com/spark/trt-llm/stacked-sparks)
+
+### Network Prerequisites (Cluster Only)
+
+1. **QSFP cable connection** between nodes (ConnectX-7 ports)
+
+2. **Network interfaces configured**
+   ```bash
+   # Check interfaces are up
+   ip addr show enp1s0f0np0
+   ip addr show enp1s0f1np1
+   ```
+
+3. **Passwordless SSH** from primary → secondary
+   ```bash
+   # Test from primary node
+   ssh $SPARK_SECONDARY_HOST hostname
+   # Should return secondary hostname without password prompt
+   ```
+
+4. **Docker Swarm initialized** and both nodes joined
+   ```bash
+   # Check on primary (manager)
+   docker node ls
+   # Should show both nodes as "Ready"
+   ```
+
+5. **GPU resources advertised** to Docker Swarm
+   - Each node must have `/etc/docker/daemon.json` configured with GPU UUID
+   - NVIDIA Container Runtime configured in `/etc/nvidia-container-runtime/config.toml`
+   - See NVIDIA docs for details
+
+### Environment Setup
+
+**Required on ALL nodes:**
+
+```bash
+export HF_TOKEN=hf_...  # Your Hugging Face token
+```
+
+**Recommended on ALL nodes** (add to `~/.bashrc`):
 
 ```bash
 export PATH="$HOME/spark-tools/trtllm:$PATH"
+export SPARK_PRIMARY_HOST=<your-primary-hostname>
+export SPARK_SECONDARY_HOST=<your-secondary-hostname>
 ```
 
-That lets you just run:
+### Directory Structure
 
-```bash
-trtllm-new-model.sh nvidia/Qwen3-14B-FP4
+These scripts expect to be installed at:
+```
+~/spark-tools/trtllm/
 ```
 
-from anywhere, instead of cd’ing into the folder all the time.
-
-### Docker / Swarm expectations
-
-These scripts assume:
-
-- Docker Swarm is initialized
-- You’ve deployed the TRT-LLM multinode stack using NVIDIA’s `docker-compose.yml`
-
-By default they expect:
-
-- Stack name: `trtllm-multinode`
-- Service name: `trtllm`
-
-The helper script `trtllm-container.sh` looks up the running TRT-LLM service container and returns its ID. Everything else builds on top of that.
-
-### Connectivity
-
-- Passwordless SSH from **primary → secondary**:
-  - From `$SPARK_PRIMARY_HOST` you should be able to run:
-    ```bash
-    ssh $SPARK_SECONDARY_HOST hostname
-    ```
-- For **single-node** use (no remote host), just don’t use the cluster scripts, or set:
-  ```bash
-  export SPARK_SECONDARY_HOST=$SPARK_PRIMARY_HOST
-  ```
-  so remote checks don’t complain.
-
-### Hugging Face token
-
-On **both nodes**:
-
-```bash
-export HF_TOKEN=hf_...
-```
-
-The download scripts will pass this into the TRT-LLM container and use `huggingface-cli download`.
+On **both nodes** for cluster setups.
 
 ---
 
-## Script overview
+## System Health Checks
 
-### 1. `trtllm-container.sh`
+Before using these scripts, verify your setup:
 
-> Find the TRT-LLM container ID on the **local** node.
+### Single-Node Checks
+
+```bash
+# 1. Docker and GPU access
+docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+
+# 2. TRT-LLM container running
+docker ps | grep trtllm
+
+# 3. GPU memory available
+nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits
+```
+
+### Cluster Checks
+
+Run these from your **primary** node:
+
+```bash
+# 1. Docker Swarm healthy
+docker node ls
+# Both nodes should show "Ready" and "Active"
+
+# 2. SSH connectivity
+ssh $SPARK_SECONDARY_HOST 'echo "Connection OK"'
+
+# 3. Network interfaces on both nodes
+ip addr show enp1s0f0np0
+ssh $SPARK_SECONDARY_HOST 'ip addr show enp1s0f0np0'
+
+# 4. GPU visible on both nodes
+nvidia-smi
+ssh $SPARK_SECONDARY_HOST 'nvidia-smi'
+
+# 5. TRT-LLM stack deployed
+docker stack ls | grep trtllm-multinode
+
+# 6. Containers running on both nodes
+docker stack ps trtllm-multinode
+# Should show 2 tasks in "Running" state
+```
+
+---
+
+## Script Reference
+
+### Core Scripts
+
+#### `trtllm-container.sh`
+Find the local TRT-LLM container ID.
 
 ```bash
 trtllm-container.sh
+# Output: container ID (e.g., 97dc1d9ac139)
 ```
 
-Outputs a single container ID, e.g.:
-
-```text
-97dc1d9ac139
-```
-
-Every other script uses this to `docker exec` into the right place.
+Used internally by other scripts.
 
 ---
 
-### 2. `trtllm-download.sh`
-
-> Download (or resume) a Hugging Face model **inside the TRT-LLM container on this node**, in the background.
-
-Usage:
+#### `trtllm-download.sh`
+Download model inside TRT-LLM container (local node only).
 
 ```bash
-trtllm-download.sh start  nvidia/Qwen3-14B-FP4
+# Start background download
+trtllm-download.sh download nvidia/Qwen3-14B-FP4
+
+# Check download status
 trtllm-download.sh status nvidia/Qwen3-14B-FP4
 ```
 
-- `start`:
-  - Runs `huggingface-cli download <model>` inside the container via `nohup`.
-  - Writes a log: `/tmp/hf_download_<sanitized-model-name>.log` (inside the container).
-  - Keeps running even if your SSH session disconnects.
-- `status`:
-  - Shows the tail of that log so you can see what it’s doing.
-
-This script is **local-only**. It only talks to the TRT-LLM container on whatever node you’re on.
-
-Works fine for both:
-
-- Single-node (just run this on your one host)
-- Swarm/multi-node (used indirectly by `cluster-download.sh`)
+**Features:**
+- Runs in background via `nohup`
+- Survives SSH disconnects
+- Logs to `/tmp/hf_download_<model>.log` (inside container)
 
 ---
 
-### 3. `cluster-download.sh`
-
-> Kick off the same model download on **both** primary and secondary nodes in one shot.
-
-Usage (run on the **primary** node):
+#### `cluster-download.sh`
+Kick off model download on **both** primary and secondary nodes.
 
 ```bash
-cluster-download.sh nvidia/Qwen3-14B-FP4
+cluster-download.sh nvidia/Qwen3-235B-A22B-FP4
 ```
 
-What it does:
+**Requires:** `HF_TOKEN` set, passwordless SSH to secondary.
 
-- Determines:
-  - `PRIMARY_HOST` (from `SPARK_PRIMARY_HOST` or `hostname`)
-  - `SECONDARY_HOST` (from `SPARK_SECONDARY_HOST` or default `dyad`)
-- On the **primary** host:
-  - Calls `trtllm-download.sh start <model>`
-- On the **secondary** host:
-  - SSHes into `$SECONDARY_HOST`
-  - Ensures `PATH` includes `~/spark-tools/trtllm`
-  - Calls `trtllm-download.sh start <model>` there too
-
-It prints a reminder at the end of how to check status.
+Starts background downloads on both nodes simultaneously.
 
 ---
 
-### 4. `trtllm-model-status.sh`
-
-> Check whether a model’s cache is **complete** on primary and secondary.
-
-Usage:
+#### `trtllm-model-status.sh`
+Check model download status on **both** nodes.
 
 ```bash
 trtllm-model-status.sh nvidia/Qwen3-14B-FP4
 ```
 
-Example output:
-
-```text
-Primary host:   monad
-Secondary host: dyad
-
-============================================================
-Node: monad (local)
-Container: 97dc1d9ac139
-Model cache path: /root/.cache/huggingface/hub/models--nvidia--Qwen3-14B-FP4
-Status: COMPLETE
-  Total files:      17
-  Incomplete files: 0
-  Approx size:      7.0G
-
-============================================================
-Node: dyad (via ssh)
-Container: 83b4a5c91a0e
-Model cache path: /root/.cache/huggingface/hub/models--nvidia--Qwen3-14B-FP4
-Status: COMPLETE
-  Total files:      17
-  Incomplete files: 0
-  Approx size:      7.0G
-```
-
-Under the hood (inside each container) it:
-
-- Checks for `/root/.cache/huggingface/hub/models--<org>--<name>`
-- Counts:
-  - All files
-  - `*.incomplete` blobs
-- Computes `du -sh` on the model directory
-- Classifies status as:
-  - `COMPLETE` – no `*.incomplete`, and files exist
-  - `IN_PROGRESS` – some `*.incomplete`
-  - `NOT_STARTED` / `UNKNOWN` – no cache dir or nothing useful
-
-On single-node, this is overkill; you can still use it, but the “remote” part is only useful if `SPARK_SECONDARY_HOST` points at a second machine.
+**Output per node:**
+- `COMPLETE` - Model fully downloaded, ready to serve
+- `IN_PROGRESS` - Download still running (shows incomplete file count)
+- `NOT_STARTED` - Model cache directory doesn't exist
 
 ---
 
-### 5. `trtllm-serve.sh`
-
-> Start the TensorRT-LLM multi-node server for a given model (from the primary node).
-
-Usage:
+#### `trtllm-new-model.sh`
+**High-level helper:** Download + status for cluster workflow.
 
 ```bash
-trtllm-serve.sh nvidia/Qwen3-14B-FP4 8355 2
+trtllm-new-model.sh nvidia/Qwen3-235B-A22B-FP4 8355 2
 ```
 
-Parameters:
+**Parameters:**
+- `MODEL` - Hugging Face model ID
+- `PORT` - Serving port (default: 8355)
+- `TP_SIZE` - Tensor parallel size (default: 2)
 
-- `MODEL` – Hugging Face model id (e.g. `nvidia/Qwen3-14B-FP4`)
-- `PORT` – HTTP port (inside the container) for Uvicorn (default `8355`)
-- `TP_SIZE` – tensor parallel size (default `2` for a two-node setup)
-
-What it does:
-
-- Finds the local TRT-LLM container
-- Runs `mpirun` inside it, using the OpenMPI hostfile (`/etc/openmpi-hostfile`) set up during stack deploy
-- Starts:
-  - Rank 0: `trtllm-serve` (HTTP server) + management node
-  - Rank 1: worker node on the other host
-
-If all goes well, you’ll eventually see:
-
-```text
-INFO:     Uvicorn running on http://localhost:8355 (Press CTRL+C to quit)
-```
-
-On a **single node**, you can still use this pattern (with `tp_size = 1`), but the multi-node bits (OpenMPI hostfile etc.) don’t matter.
+Does:
+1. Calls `cluster-download.sh` to start downloads
+2. Tells you to monitor with `trtllm-model-status.sh`
+3. Tells you the serve command once downloads complete
 
 ---
 
-### 6. `trtllm-validate.sh`
+#### `trtllm-serve.sh`
+Start TensorRT-LLM server.
 
-> Sanity-check that the model is serving and look at GPU memory usage on both nodes.
+```bash
+trtllm-serve.sh nvidia/Qwen3-14B-FP4 8355 2 0.9
+```
 
-Usage:
+**Parameters:**
+- `MODEL` - Hugging Face model ID (required)
+- `PORT` - HTTP port (default: 8355)
+- `TP_SIZE` - Tensor parallel size (default: 2)
+- `GPU_MEM_FRACTION` - KV cache memory fraction (default: 0.9)
+
+**Features:**
+- Validates model is fully downloaded before serving
+- Configures KV cache memory
+- Uses MPI for multi-node (TP_SIZE > 1)
+
+**Blocks until you Ctrl+C.** Run in a `tmux` or `screen` session.
+
+---
+
+#### `trtllm-validate.sh`
+Health check: GPU memory + HTTP endpoint test.
 
 ```bash
 trtllm-validate.sh nvidia/Qwen3-14B-FP4 8355
 ```
 
-It does:
+**Checks:**
+1. TRT-LLM container exists on primary
+2. `nvidia-smi` output on both nodes (cluster only)
+3. HTTP `/v1/chat/completions` endpoint responds with valid completion
 
-1. **Container sanity check** on the primary:
-   - Uses `trtllm-container.sh` and errors if nothing is running.
-2. **GPU usage**:
-   - Runs `nvidia-smi` on the primary host.
-   - SSHes to the secondary host and runs `nvidia-smi` there as well.
-3. **HTTP endpoint check**:
-   - Sends a small OpenAI-style `chat/completions` request to:
-     ```text
-     http://localhost:<PORT>/v1/chat/completions
-     ```
-   - Verifies:
-     - HTTP 2xx
-     - Response JSON has a `choices[0].message.content`
-   - Prints a short snippet of the content.
-
-Example HTTP bit:
-
-```text
-=== HTTP endpoint check ===
-Checking http://localhost:8355/v1/chat/completions...
-
+**Example output:**
+```
 ✅ Endpoint healthy (HTTP 200)
-Sample content: "<think>
-Okay, the user is asking about a health check from a script called"...
+Sample content: "Paris is a beautiful city known for..."
 ```
-
-On a **single node**, this will still work, but the “secondary” `nvidia-smi` part will only succeed if `SPARK_SECONDARY_HOST` points to something real (could just be `PRIMARY_HOST` too).
 
 ---
 
-### 7. `trtllm-bench.sh`
-
-> Send a few requests and compute basic latency / throughput numbers.
-
-Usage:
+#### `trtllm-bench.sh`
+Simple throughput benchmark.
 
 ```bash
-# defaults: 3 runs, max_tokens=256
-trtllm-bench.sh nvidia/Qwen3-14B-FP4 8355
-
-# override run count and max_tokens
-trtllm-bench.sh nvidia/Qwen3-14B-FP4 8355 5 256
+trtllm-bench.sh nvidia/Qwen3-14B-FP4 8355 3 256
 ```
 
-Parameters:
+**Parameters:**
+- `MODEL` - Model ID
+- `PORT` - HTTP port
+- `RUNS` - Number of requests (default: 3)
+- `MAX_TOKENS` - Max tokens per request (default: 256)
 
-- `MODEL`
-- `PORT`
-- `RUNS` (default: 3)
-- `MAX_TOKENS` (default: 256)
-
-For each run:
-
-- Uses `curl` to send a `chat/completions` request with `max_tokens = MAX_TOKENS`.
-- Measures latency (wall-clock).
-- Parses the JSON and extracts `usage.total_tokens`.
-- Computes tokens/sec for that run.
-
-Then it prints a summary:
-
-```text
-=== Summary ===
-Effective runs: 5
-Total time:     73.547 s
-Total tokens:   1254
-Avg latency:    14.709 s
-Avg tokens/s:   17.05
-```
-
-This is just a “sanity perf” check, not a full benchmark harness.
-
-Works fine in both multi-node and single-node cases as long as the server is up and listening on the given port.
+**Output:**
+- Per-run: latency, token count, tokens/sec
+- Summary: average latency, average tokens/sec
 
 ---
 
-### 8. `trtllm-stop.sh`
-
-> Stop the serving processes, optionally remove the stack, optionally tear down the Swarm.
-
-Usage:
+#### `trtllm-stop.sh`
+Stop serving processes and/or tear down infrastructure.
 
 ```bash
-# default: just kill the TRT-LLM processes inside containers on both nodes
+# Just kill TRT-LLM processes (default)
 trtllm-stop.sh
 
-# kill processes + remove Docker stack
+# Kill processes + remove Docker stack
 trtllm-stop.sh --stack
 
-# kill processes + remove stack + have both nodes leave the Swarm
+# Kill processes + remove stack + leave swarm
 trtllm-stop.sh --swarm
 ```
 
-Modes:
-
-- `--kill-only` (default):
-  - On primary and secondary:
-    - Find the TRT-LLM container.
-    - `pkill` any `trtllm-llmapi-launch`, `trtllm-serve`, `uvicorn` processes inside.
-- `--stack`:
-  - Does `--kill-only`, then on the primary:
-    - `docker stack rm trtllm-multinode`
-- `--swarm`:
-  - Does `--stack`, then:
-    - SSH to secondary: `docker swarm leave --force`
-    - On primary: `docker swarm leave --force`
-
-If you’re just bouncing models, `--kill-only` is usually enough.
+**Modes:**
+- `--kill-only` (default): `pkill` TRT-LLM processes on both nodes
+- `--stack`: Above + `docker stack rm`
+- `--swarm`: Above + both nodes leave swarm
 
 ---
 
-### 9. `trtllm-mn-entrypoint.sh`
+## Configuration
 
-This is basically the entrypoint script NVIDIA provides for the multi-node TRT-LLM container. You normally **don’t** call this by hand; it’s used by the `docker-compose.yml` stack.
+### Host Names
 
-I keep it here so everything needed to recreate the stack/container behavior is in one place.
+Scripts default to:
+- Primary: `$(hostname)` on the node you run from
+- Secondary: `dyad`
+
+**Override with environment variables:**
+```bash
+export SPARK_PRIMARY_HOST=spark-001
+export SPARK_SECONDARY_HOST=spark-002
+```
+
+### Stack Name
+
+Scripts expect Docker stack named: `trtllm-multinode`
+
+To change: edit `STACK_NAME` in `trtllm-stop.sh` or container name pattern in `trtllm-container.sh`.
+
+### GPU Memory Fraction
+
+Default: `0.9` (NVIDIA recommended)
+
+Override per-invocation:
+```bash
+trtllm-serve.sh nvidia/Qwen3-14B-FP4 8355 2 0.75
+```
 
 ---
 
-## Quick workflows
+## Troubleshooting
 
-### A. Multi-node Swarm workflow (two Spark nodes)
+### "Could not find TRT-LLM container"
 
-On **both nodes** (once per shell / in your `.bashrc`):
-
+**Check:**
 ```bash
-export HF_TOKEN=hf_...
-export PATH="$HOME/spark-tools/trtllm:$PATH"
-export SPARK_PRIMARY_HOST=monad        # or your actual manager hostname
-export SPARK_SECONDARY_HOST=dyad      # or your actual worker hostname
+docker ps | grep trtllm
 ```
 
-Then on the **primary** host:
+**Fix:**
+- Single-node: Ensure TRT-LLM container is running
+- Cluster: Ensure stack is deployed: `docker stack ps trtllm-multinode`
 
+### Model download hangs or fails
+
+**Check logs:**
 ```bash
-cd ~/spark-tools/trtllm
-
-# 1. New model helper: kicks off downloads on both nodes
-trtllm-new-model.sh nvidia/Qwen3-14B-FP4 8355 2
-
-# (Behind the scenes this runs cluster-download.sh for you.)
-
-# 2. Poll until both nodes are done
-trtllm-model-status.sh nvidia/Qwen3-14B-FP4
-
-# 3. Start serving
-trtllm-serve.sh nvidia/Qwen3-14B-FP4 8355 2
-
-# 4. Validate
-trtllm-validate.sh nvidia/Qwen3-14B-FP4 8355
-
-# 5. Sanity benchmark
-trtllm-bench.sh nvidia/Qwen3-14B-FP4 8355
-
-# 6. When done for the day
-trtllm-stop.sh --stack         # or --kill-only, or --swarm if you want to nuke the Swarm
-```
-
-### B. Single-node workflow (no Swarm, just one Spark box)
-
-On your single node:
-
-```bash
-export HF_TOKEN=hf_...
-export PATH="$HOME/spark-tools/trtllm:$PATH"
-export SPARK_PRIMARY_HOST=$(hostname)
-# Optional: quiet down remote checks by pointing SECONDARY at the same host
-export SPARK_SECONDARY_HOST=$SPARK_PRIMARY_HOST
-```
-
-Then:
-
-```bash
-cd ~/spark-tools/trtllm
-
-# 1. Download the model inside the local TRT-LLM container
-trtllm-download.sh start nvidia/Qwen3-14B-FP4
-
-# 2. Check progress
 trtllm-download.sh status nvidia/Qwen3-14B-FP4
-trtllm-model-status.sh nvidia/Qwen3-14B-FP4   # mostly useful for the "local" side
-
-# 3. Start serving (tp_size=1 if you want)
-trtllm-serve.sh nvidia/Qwen3-14B-FP4 8355 1
-
-# 4. Validate and benchmark
-trtllm-validate.sh nvidia/Qwen3-14B-FP4 8355
-trtllm-bench.sh    nvidia/Qwen3-14B-FP4 8355
-
-# 5. Stop serving
-trtllm-stop.sh --kill-only
 ```
 
-Once this all feels solid, the plan is to throw it into a repo (`spark-tools`) so other DGX Spark folks can just clone, tweak host names / stack names, and get to "serving big models" without quite as much pain.
+**Common causes:**
+- Invalid `HF_TOKEN`
+- No disk space: `df -h`
+- Network issues
+
+### "Model not ready" when serving
+
+**Check status:**
+```bash
+trtllm-model-status.sh nvidia/Qwen3-14B-FP4
+```
+
+Wait until both nodes show: `Incomplete files: 0`
+
+### MPI/network warnings during serve
+
+```
+UCX WARN network device 'enp1s0f0np0' is not available
+```
+
+**This is usually OK** - means only one of two CX-7 ports is used. Ignore if inference works.
+
+### Secondary node unreachable
+
+**Test SSH:**
+```bash
+ssh $SPARK_SECONDARY_HOST hostname
+```
+
+**Fix:**
+- Ensure passwordless SSH is set up
+- Check `SPARK_SECONDARY_HOST` is correct
+- Verify secondary node is powered on and networked
+
+### Low throughput
+
+**Check:**
+1. GPU memory not saturated:
+   ```bash
+   nvidia-smi
+   ```
+   If memory is near full, reduce `GPU_MEM_FRACTION`
+
+2. Both GPUs active (cluster):
+   ```bash
+   trtllm-validate.sh <model> <port>
+   ```
+   Should show GPU usage on both nodes
+
+3. Model size appropriate for hardware:
+   - Single Spark: Up to ~200B parameters
+   - Two Sparks: Up to 405B parameters
+
+---
+
+## Model Size Guidelines
+
+**Single DGX Spark (128GB):**
+- Up to ~200B parameters
+- Examples: Qwen3-14B, Llama-3-70B, Mixtral-8x22B
+
+**Two DGX Sparks (256GB total):**
+- Up to 405B parameters
+- Examples: Qwen3-235B, Llama-3.3-405B
+
+**TP_SIZE recommendations:**
+- Single node: `TP_SIZE=1`
+- Two nodes: `TP_SIZE=2`
+
+---
+
+## Additional Resources
+
+- [DGX Spark Hardware Docs](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)
+- [NVIDIA Stacked Sparks Setup](https://build.nvidia.com/spark/trt-llm/stacked-sparks)
+- [TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/)
+
+---
+
+## Contributing
+
+This toolset is designed for DGX Spark but can be adapted for other NVIDIA hardware with unified memory architectures.
+
+**To adapt:**
+1. Adjust host names via environment variables
+2. Update Docker stack/container names in scripts
+3. Modify GPU memory fractions based on your hardware
