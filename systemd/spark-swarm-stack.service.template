@@ -1,0 +1,15 @@
+[Unit]
+Description=Spark TRT-LLM Docker Swarm Stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User={{USERNAME}}
+ExecStart=/usr/bin/docker stack deploy -c {{COMPOSE_FILE}} trtllm-multinode
+ExecStop=/usr/bin/docker stack rm trtllm-multinode
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

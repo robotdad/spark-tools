@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-serve [model] [options]"
+    echo ""
+    echo "Start serving the configured model using the current mode and engine."
+    echo ""
+    echo "Arguments:"
+    echo "  model          Override MODEL_NAME from config (optional)"
+    echo ""
+    echo "The model, port, and engine settings come from:"
+    echo "  ~/.config/spark-tools/cluster.env  (mode, engine, port)"
+    echo "  ~/.config/spark-tools/model.env    (model, parallelism)"
+    echo ""
+    echo "Examples:"
+    echo "  spark-serve                                    # serve configured model"
+    echo "  spark-serve nvidia/Qwen3-14B-FP4              # override model"
+    echo ""
+    echo "See also: spark-mode, spark-set-model, spark-status"
+    exit 0
+fi
+
+spark_load_config
+
+# Optional model override from CLI
+if [[ $# -ge 1 && "$1" != -* ]]; then
+    export MODEL_NAME="$1"
+    shift
+fi
+
+[[ -z "${MODEL_NAME:-}" ]] && spark_die "No model configured. Set MODEL_NAME in model.env or pass as argument."
+
+spark_dispatch serve "$@"

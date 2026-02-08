@@ -1,0 +1,16 @@
+[Unit]
+Description=Spark vLLM Auth Proxy
+After=network.target
+
+[Service]
+Type=simple
+User={{USERNAME}}
+EnvironmentFile=/home/{{USERNAME}}/.config/vllm-proxy/secret.env
+Environment=VLLM_UPSTREAM_URL=http://localhost:{{UPSTREAM_PORT}}
+WorkingDirectory={{SPARK_TOOLS_DIR}}/proxy
+ExecStart=/usr/bin/env python3 -m uvicorn vllm_proxy:app --host 0.0.0.0 --port {{PROXY_PORT}}
+Restart=always
+RestartSec=4
+
+[Install]
+WantedBy=multi-user.target

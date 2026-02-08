@@ -1,0 +1,27 @@
+[Unit]
+Description=Spark Ray Worker Node
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User={{USERNAME}}
+ExecStartPre=-/usr/bin/docker rm -f spark-ray
+ExecStart=/usr/bin/docker run --rm --name spark-ray \
+    --gpus all --network host --shm-size 64g \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
+    -e UCX_NET_DEVICES={{QSFP_IFACE}} \
+    -e NCCL_SOCKET_IFNAME={{QSFP_IFACE}} \
+    -e OMPI_MCA_btl_tcp_if_include={{QSFP_IFACE}} \
+    -e GLOO_SOCKET_IFNAME={{QSFP_IFACE}} \
+    -e TP_SOCKET_IFNAME={{QSFP_IFACE}} \
+    -e RAY_memory_monitor_refresh_ms=0 \
+    -v /home/{{USERNAME}}/.cache/huggingface:/root/.cache/huggingface \
+    {{RAY_VLLM_IMAGE}} \
+    ray start --block --address={{HEAD_IP}}:6379
+ExecStop=/usr/bin/docker stop spark-ray
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

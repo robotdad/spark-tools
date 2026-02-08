@@ -1,0 +1,18 @@
+[Unit]
+Description=Spark vLLM Server (via Ray)
+After=spark-ray-head.service
+Requires=spark-ray-head.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User={{USERNAME}}
+EnvironmentFile=/home/{{USERNAME}}/.config/spark-tools/model.env
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do docker exec spark-ray ray status 2>/dev/null | grep -q node_ && exit 0; sleep 2; done; exit 1'
+ExecStart=/usr/bin/docker exec spark-ray bash -c 'vllm serve ${MODEL_NAME} --host 0.0.0.0 --port {{PORT}} --dtype auto --tensor-parallel-size ${TP_SIZE} --max-model-len ${MAX_MODEL_LEN} --gpu-memory-utilization ${GPU_MEM_UTIL} --distributed-executor-backend ray ${VLLM_EXTRA_ARGS}'
+ExecStop=/usr/bin/docker exec spark-ray bash -c 'pkill -f "vllm serve" || true'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

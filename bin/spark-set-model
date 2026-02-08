@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-set-model <model-name> [--tp SIZE] [--ctx LENGTH] [--mem UTIL]"
+    echo ""
+    echo "Change the active model in model.env."
+    echo "Does NOT restart services — run spark-stop && spark-serve after."
+    echo ""
+    echo "Arguments:"
+    echo "  model-name     HuggingFace model ID (e.g., nvidia/Qwen3-14B-FP4)"
+    echo ""
+    echo "Options:"
+    echo "  --tp SIZE      Tensor parallel size (default: keep current)"
+    echo "  --ctx LENGTH   Max context length (default: keep current)"
+    echo "  --mem UTIL     GPU memory utilization 0.0-1.0 (default: keep current)"
+    echo "  --served NAME  Served model name / alias (default: none)"
+    echo ""
+    echo "Examples:"
+    echo "  spark-set-model nvidia/Qwen3-235B-A22B-FP4"
+    echo "  spark-set-model Qwen/Qwen3-Coder-Next-FP8 --tp 2 --ctx 131072"
+    exit 0
+fi
+
+spark_load_config
+
+[[ $# -lt 1 ]] && spark_die "Model name required. Use --help for usage."
+
+NEW_MODEL="$1"
+shift
+
+# Parse optional overrides
+NEW_TP="" NEW_CTX="" NEW_MEM="" NEW_SERVED="" SET_SERVED=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tp)     shift; NEW_TP="${1:-}"; [[ -z "$NEW_TP" ]] && spark_die "--tp requires a value" ;;
+        --ctx)    shift; NEW_CTX="${1:-}"; [[ -z "$NEW_CTX" ]] && spark_die "--ctx requires a value" ;;
+        --mem)    shift; NEW_MEM="${1:-}"; [[ -z "$NEW_MEM" ]] && spark_die "--mem requires a value" ;;
+        --served) shift; NEW_SERVED="${1:-}"; SET_SERVED=true ;;
+        *) spark_die "Unknown option: $1" ;;
+    esac
+    shift
+done
+
+# Update model.env
+sed -i "s|^MODEL_NAME=.*|MODEL_NAME=${NEW_MODEL}|" "$SPARK_MODEL_ENV"
+[[ -n "$NEW_TP" ]]     && sed -i "s/^TP_SIZE=.*/TP_SIZE=${NEW_TP}/" "$SPARK_MODEL_ENV"
+[[ -n "$NEW_CTX" ]]    && sed -i "s/^MAX_MODEL_LEN=.*/MAX_MODEL_LEN=${NEW_CTX}/" "$SPARK_MODEL_ENV"
+[[ -n "$NEW_MEM" ]]    && sed -i "s/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=${NEW_MEM}/" "$SPARK_MODEL_ENV"
+[[ "$SET_SERVED" == true ]] && sed -i "s/^SERVED_MODEL_NAME=.*/SERVED_MODEL_NAME=${NEW_SERVED}/" "$SPARK_MODEL_ENV"
+
+echo "Model updated in $SPARK_MODEL_ENV:"
+echo "  MODEL_NAME=${NEW_MODEL}"
+[[ -n "$NEW_TP" ]]     && echo "  TP_SIZE=${NEW_TP}"
+[[ -n "$NEW_CTX" ]]    && echo "  MAX_MODEL_LEN=${NEW_CTX}"
+[[ -n "$NEW_MEM" ]]    && echo "  GPU_MEM_UTIL=${NEW_MEM}"
+[[ "$SET_SERVED" == true ]] && echo "  SERVED_MODEL_NAME=${NEW_SERVED}"
+echo ""
+echo "Restart to apply: spark-stop && spark-serve"

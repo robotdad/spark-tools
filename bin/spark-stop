@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-stop [options]"
+    echo ""
+    echo "Stop the currently running inference services."
+    echo ""
+    echo "In swarm+trtllm mode, supports:"
+    echo "  --kill-only    Kill server processes only (default)"
+    echo "  --stack        Also remove the Docker stack"
+    echo "  --swarm        Also leave the Swarm"
+    echo ""
+    echo "In ray mode: stops Ray head/worker services and vLLM."
+    exit 0
+fi
+
+spark_load_config
+spark_dispatch stop "$@"

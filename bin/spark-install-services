@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-install-services [--mode swarm|ray] [--dry-run]"
+    echo ""
+    echo "Install systemd service units for the specified mode."
+    echo "Requires sudo for writing to /etc/systemd/system/."
+    echo ""
+    echo "Options:"
+    echo "  --mode MODE    Install services for this mode (default: current SPARK_MODE)"
+    echo "  --dry-run      Show what would be installed without writing files"
+    echo "  --uninstall    Remove installed services"
+    exit 0
+fi
+
+spark_load_config
+
+DRY_RUN=false
+UNINSTALL=false
+INSTALL_MODE="$SPARK_MODE"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mode) shift; INSTALL_MODE="${1:-}"; [[ -z "$INSTALL_MODE" ]] && spark_die "--mode requires a value" ;;
+        --dry-run) DRY_RUN=true ;;
+        --uninstall) UNINSTALL=true ;;
+        *) spark_die "Unknown option: $1" ;;
+    esac
+    shift
+done
+
+SYSTEMD_DIR="/etc/systemd/system"
+TEMPLATES_DIR="${SPARK_TOOLS_DIR}/systemd"
+USERNAME="$(whoami)"
+
+# Detect HEAD_IP on QSFP
+HEAD_IP=$(ip -4 addr show "$SPARK_QSFP_IFACE" 2>/dev/null | grep -oP 'inet \K[\d.]+' || hostname -I | awk '{print $1}')
+
+# Template substitution function
+process_template() {
+    local template="$1"
+    sed \
+        -e "s|{{USERNAME}}|${USERNAME}|g" \
+        -e "s|{{SPARK_TOOLS_DIR}}|${SPARK_TOOLS_DIR}|g" \
+        -e "s|{{COMPOSE_FILE}}|${HOME}/docker-compose.yml|g" \
+        -e "s|{{QSFP_IFACE}}|${SPARK_QSFP_IFACE}|g" \
+        -e "s|{{HEAD_IP}}|${HEAD_IP}|g" \
+        -e "s|{{RAY_VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
+        -e "s|{{PORT}}|${SPARK_PORT:-8000}|g" \
+        "$template"
+}
+
+if [[ "$UNINSTALL" == true ]]; then
+    echo "Uninstalling spark services..."
+    for svc in spark-swarm-stack spark-ray-head spark-ray-worker spark-ray-vllm; do
+        if [[ -f "$SYSTEMD_DIR/${svc}.service" ]]; then
+            echo "  Disabling and removing ${svc}.service"
+            if [[ "$DRY_RUN" != true ]]; then
+                sudo systemctl disable "${svc}.service" 2>/dev/null || true
+                sudo systemctl stop "${svc}.service" 2>/dev/null || true
+                sudo rm -f "$SYSTEMD_DIR/${svc}.service"
+            fi
+        fi
+    done
+    [[ "$DRY_RUN" != true ]] && sudo systemctl daemon-reload
+    echo "Done."
+    exit 0
+fi
+
+echo "=== Installing Systemd Services (mode: ${INSTALL_MODE}) ==="
+echo ""
+
+case "$INSTALL_MODE" in
+    swarm)
+        TEMPLATES=("spark-swarm-stack.service.template")
+        ;;
+    ray)
+        # Determine which node we're on
+        if [[ "$(hostname)" == "$SPARK_PRIMARY_HOST" || "$(hostname)" == "$(echo "$SPARK_PRIMARY_HOST" | cut -d. -f1)" ]]; then
+            TEMPLATES=("spark-ray-head.service.template" "spark-ray-vllm.service.template")
+            echo "Detected: HEAD node (${SPARK_PRIMARY_HOST})"
+        else
+            TEMPLATES=("spark-ray-worker.service.template")
+            echo "Detected: WORKER node"
+        fi
+        ;;
+    *)
+        spark_die "Unknown mode: $INSTALL_MODE"
+        ;;
+esac
+
+for tmpl in "${TEMPLATES[@]}"; do
+    SVC_NAME="${tmpl%.template}"
+    TMPL_PATH="${TEMPLATES_DIR}/${tmpl}"
+
+    if [[ ! -f "$TMPL_PATH" ]]; then
+        spark_warn "Template not found: $TMPL_PATH (skipping)"
+        continue
+    fi
+
+    echo "Processing: $tmpl → $SVC_NAME"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "--- BEGIN $SVC_NAME ---"
+        process_template "$TMPL_PATH"
+        echo "--- END $SVC_NAME ---"
+        echo ""
+    else
+        process_template "$TMPL_PATH" | sudo tee "$SYSTEMD_DIR/$SVC_NAME" > /dev/null
+        echo "  Installed: $SYSTEMD_DIR/$SVC_NAME"
+    fi
+done
+
+if [[ "$DRY_RUN" != true ]]; then
+    sudo systemctl daemon-reload
+    echo ""
+    echo "Services installed. Enable with:"
+    for tmpl in "${TEMPLATES[@]}"; do
+        SVC_NAME="${tmpl%.template}"
+        echo "  sudo systemctl enable ${SVC_NAME}"
+    done
+    echo ""
+    echo "Start with:"
+    for tmpl in "${TEMPLATES[@]}"; do
+        SVC_NAME="${tmpl%.template}"
+        echo "  sudo systemctl start ${SVC_NAME}"
+    done
+fi

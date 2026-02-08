@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-status"
+    echo ""
+    echo "Show cluster health and service status."
+    echo "Checks: cluster nodes, containers, GPU, API endpoint."
+    exit 0
+fi
+
+spark_load_config
+spark_dispatch status "$@"

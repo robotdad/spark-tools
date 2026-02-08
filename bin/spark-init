@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SPARK_TOOLS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-init [--force]"
+    echo ""
+    echo "Initialize spark-tools configuration."
+    echo "Creates config files in ${CONFIG_DIR}/"
+    echo ""
+    echo "Options:"
+    echo "  --force    Overwrite existing config files"
+    exit 0
+fi
+
+FORCE=false
+[[ "${1:-}" == "--force" ]] && FORCE=true
+
+echo "=== Spark Tools Initialization ==="
+echo ""
+
+# Create config directory
+mkdir -p "$CONFIG_DIR"
+echo "Config directory: $CONFIG_DIR"
+echo ""
+
+# --- Auto-detection ---
+DETECTED_HOSTNAME="$(hostname)"
+echo "Detected hostname: $DETECTED_HOSTNAME"
+
+# Detect QSFP interface
+DETECTED_QSFP=""
+for iface in enp1s0f0np0 enp1s0f1np1 ib0; do
+    if ip link show "$iface" &>/dev/null; then
+        DETECTED_QSFP="$iface"
+        break
+    fi
+done
+if [[ -n "$DETECTED_QSFP" ]]; then
+    echo "Detected QSFP interface: $DETECTED_QSFP"
+else
+    echo "WARNING: No QSFP interface detected (checked enp1s0f0np0, enp1s0f1np1, ib0)"
+    DETECTED_QSFP="enp1s0f0np0"
+fi
+
+# Detect secondary host
+DETECTED_SECONDARY=""
+if [[ "$DETECTED_HOSTNAME" == "monad" ]]; then
+    DETECTED_SECONDARY="dyad"
+elif [[ "$DETECTED_HOSTNAME" == "dyad" ]]; then
+    DETECTED_SECONDARY="monad"
+else
+    # Try common patterns
+    for candidate in dyad monad spark-2 spark-1; do
+        if [[ "$candidate" != "$DETECTED_HOSTNAME" ]] && ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no "$candidate" hostname &>/dev/null; then
+            DETECTED_SECONDARY="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -n "$DETECTED_SECONDARY" ]]; then
+    echo "Detected secondary host: $DETECTED_SECONDARY"
+else
+    echo "WARNING: Could not detect secondary host"
+    DETECTED_SECONDARY="dyad"
+fi
+
+echo ""
+
+# --- Write cluster.env ---
+if [[ -f "$CONFIG_DIR/cluster.env" && "$FORCE" != true ]]; then
+    echo "cluster.env already exists (use --force to overwrite)"
+else
+    sed \
+        -e "s/^SPARK_PRIMARY_HOST=.*/SPARK_PRIMARY_HOST=${DETECTED_HOSTNAME}/" \
+        -e "s/^SPARK_SECONDARY_HOST=.*/SPARK_SECONDARY_HOST=${DETECTED_SECONDARY}/" \
+        -e "s/^SPARK_QSFP_IFACE=.*/SPARK_QSFP_IFACE=${DETECTED_QSFP}/" \
+        "$SPARK_TOOLS_DIR/config/cluster.env.example" > "$CONFIG_DIR/cluster.env"
+    echo "Created: $CONFIG_DIR/cluster.env"
+fi
+
+# --- Write model.env ---
+if [[ -f "$CONFIG_DIR/model.env" && "$FORCE" != true ]]; then
+    echo "model.env already exists (use --force to overwrite)"
+else
+    cp "$SPARK_TOOLS_DIR/config/model.env.example" "$CONFIG_DIR/model.env"
+    echo "Created: $CONFIG_DIR/model.env"
+fi
+
+echo ""
+echo "=== Initialization Complete ==="
+echo ""
+echo "Edit your config:"
+echo "  $CONFIG_DIR/cluster.env   - cluster settings (mode, hosts, network)"
+echo "  $CONFIG_DIR/model.env     - model settings (model, parallelism, memory)"
+echo ""
+echo "Quick start:"
+echo "  spark-mode              - show current mode"
+echo "  spark-mode ray          - switch to Ray mode"
+echo "  spark-serve             - start serving configured model"
+echo "  spark-status            - check cluster health"

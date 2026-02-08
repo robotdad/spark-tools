@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-mode [swarm|ray] [--engine trtllm|vllm]"
+    echo ""
+    echo "View or switch cluster orchestration mode."
+    echo ""
+    echo "With no arguments, shows current mode and engine."
+    echo ""
+    echo "Modes:"
+    echo "  swarm   Docker Swarm + MPI (supports trtllm and vllm)"
+    echo "  ray     Ray cluster (supports vllm only)"
+    echo ""
+    echo "Options:"
+    echo "  --engine ENGINE   Also switch inference engine (trtllm or vllm)"
+    echo ""
+    echo "Examples:"
+    echo "  spark-mode                    # show current mode"
+    echo "  spark-mode ray                # switch to ray mode"
+    echo "  spark-mode swarm --engine trtllm   # switch to swarm + trtllm"
+    exit 0
+fi
+
+spark_load_config
+
+# No arguments: show current mode
+if [[ $# -eq 0 ]]; then
+    spark_show_config
+    exit 0
+fi
+
+# Parse arguments
+NEW_MODE=""
+NEW_ENGINE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        swarm|ray) NEW_MODE="$1" ;;
+        --engine) shift; NEW_ENGINE="${1:-}"; [[ -z "$NEW_ENGINE" ]] && spark_die "--engine requires a value" ;;
+        *) spark_die "Unknown argument: $1. Use --help for usage." ;;
+    esac
+    shift
+done
+
+# Apply defaults
+NEW_MODE="${NEW_MODE:-$SPARK_MODE}"
+NEW_ENGINE="${NEW_ENGINE:-$SPARK_ENGINE}"
+
+# Auto-correct engine for ray mode
+if [[ "$NEW_MODE" == "ray" && "$NEW_ENGINE" == "trtllm" ]]; then
+    spark_warn "Ray mode does not support trtllm. Switching engine to vllm."
+    NEW_ENGINE="vllm"
+fi
+
+# Validate
+if [[ "$NEW_MODE" == "$SPARK_MODE" && "$NEW_ENGINE" == "$SPARK_ENGINE" ]]; then
+    echo "Already in ${NEW_MODE} + ${NEW_ENGINE} mode. No change."
+    exit 0
+fi
+
+echo "Switching: ${SPARK_MODE}+${SPARK_ENGINE} → ${NEW_MODE}+${NEW_ENGINE}"
+echo ""
+
+# Update cluster.env
+sed -i \
+    -e "s/^SPARK_MODE=.*/SPARK_MODE=${NEW_MODE}/" \
+    -e "s/^SPARK_ENGINE=.*/SPARK_ENGINE=${NEW_ENGINE}/" \
+    "$SPARK_CLUSTER_ENV"
+
+echo "Updated: $SPARK_CLUSTER_ENV"
+echo ""
+
+# Auto-adjust port defaults in model.env when switching engines
+if [[ "$NEW_ENGINE" != "$SPARK_ENGINE" ]]; then
+    if [[ "$NEW_ENGINE" == "trtllm" ]]; then
+        spark_info "Note: TRT-LLM uses port ${TRTLLM_PORT:-8355} by default"
+    else
+        spark_info "Note: vLLM uses port ${SPARK_PORT:-8000} by default"
+    fi
+fi
+
+echo ""
+echo "Current mode is now: ${NEW_MODE} + ${NEW_ENGINE}"
+echo ""
+echo "If services are running, stop and restart them:"
+echo "  spark-stop && spark-serve"

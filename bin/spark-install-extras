@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-install-extras [--motd] [--proxy] [--symlinks] [--all]"
+    echo ""
+    echo "Install optional components."
+    echo ""
+    echo "Options:"
+    echo "  --motd       Install login banner to /etc/motd (requires sudo)"
+    echo "  --proxy      Initialize auth proxy secret"
+    echo "  --symlinks   Create /usr/local/bin symlinks for spark-* commands"
+    echo "  --all        Install everything"
+    exit 0
+fi
+
+spark_load_config
+
+INSTALL_MOTD=false
+INSTALL_PROXY=false
+INSTALL_SYMLINKS=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --motd) INSTALL_MOTD=true ;;
+        --proxy) INSTALL_PROXY=true ;;
+        --symlinks) INSTALL_SYMLINKS=true ;;
+        --all) INSTALL_MOTD=true; INSTALL_PROXY=true; INSTALL_SYMLINKS=true ;;
+        *) spark_die "Unknown option: $arg" ;;
+    esac
+done
+
+[[ "$INSTALL_MOTD" != true && "$INSTALL_PROXY" != true && "$INSTALL_SYMLINKS" != true ]] && spark_die "No options specified. Use --help."
+
+# --- MOTD ---
+if [[ "$INSTALL_MOTD" == true ]]; then
+    echo "=== Installing MOTD ==="
+    MOTD=$(sed \
+        -e "s/{{PRIMARY_HOST}}/${SPARK_PRIMARY_HOST}/g" \
+        -e "s/{{SECONDARY_HOST}}/${SPARK_SECONDARY_HOST}/g" \
+        "${SPARK_TOOLS_DIR}/config/motd.template")
+    echo "$MOTD" | sudo tee /etc/motd > /dev/null
+    echo "Installed /etc/motd"
+    echo ""
+fi
+
+# --- Proxy Secret ---
+if [[ "$INSTALL_PROXY" == true ]]; then
+    echo "=== Initializing Auth Proxy ==="
+    "${SPARK_TOOLS_DIR}/scripts/rotate-proxy-secret.sh"
+    echo ""
+fi
+
+# --- Symlinks ---
+if [[ "$INSTALL_SYMLINKS" == true ]]; then
+    echo "=== Creating Symlinks ==="
+    for cmd in "${SPARK_TOOLS_DIR}"/bin/spark-*; do
+        name="$(basename "$cmd")"
+        echo "  /usr/local/bin/$name → $cmd"
+        sudo ln -sf "$cmd" "/usr/local/bin/$name"
+    done
+    echo ""
+fi
+
+echo "Done."

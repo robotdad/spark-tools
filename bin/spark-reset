@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: spark-reset"
+    echo ""
+    echo "Full cluster restart: stop all services, clean up, restart."
+    echo "Uses current mode and engine from config."
+    exit 0
+fi
+
+spark_load_config
+
+echo "=== Spark Cluster Reset (${SPARK_MODE} + ${SPARK_ENGINE}) ==="
+echo ""
+
+# Stop
+echo "--- Stopping services ---"
+"${SPARK_TOOLS_DIR}/bin/spark-stop" 2>&1 || true
+echo ""
+
+# Brief pause
+echo "Waiting 5 seconds..."
+sleep 5
+echo ""
+
+# Start
+echo "--- Starting services ---"
+exec "${SPARK_TOOLS_DIR}/bin/spark-serve"

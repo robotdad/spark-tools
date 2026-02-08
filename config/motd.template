@@ -1,0 +1,19 @@
+ ╔══════════════════════════════════════════════════════════════╗
+ ║                    DGX SPARK CLUSTER                        ║
+ ╠══════════════════════════════════════════════════════════════╣
+ ║                                                             ║
+ ║   {{PRIMARY_HOST}} (head)  ◄──── 200Gb QSFP ────►  {{SECONDARY_HOST}} (worker)  ║
+ ║                                                             ║
+ ╠══════════════════════════════════════════════════════════════╣
+ ║  Quick Commands:                                            ║
+ ║    spark-status       Cluster health check                  ║
+ ║    spark-serve        Start inference server                ║
+ ║    spark-stop         Stop inference server                 ║
+ ║    spark-mode         Show/switch orchestration mode        ║
+ ║    spark-set-model    Change active model                   ║
+ ║    spark-bench        Run benchmark                         ║
+ ║    spark-reset        Full cluster restart                  ║
+ ╠══════════════════════════════════════════════════════════════╣
+ ║  Config: ~/.config/spark-tools/{cluster,model}.env          ║
+ ║  Docs:   ~/spark-tools/README.md                            ║
+ ╚══════════════════════════════════════════════════════════════╝
