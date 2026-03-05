@@ -428,16 +428,8 @@ case "${1:-}" in
             echo "Switching to SPLIT mode (two independent vLLM instances, TP=1 per node)..."
             echo ""
 
-            # ── [0] Pre-flight: port availability ────────────────────────────
-            local _port="${SPARK_PORT:-8000}"
-            if ! spark_check_port "$_port" 2>/dev/null; then
-                echo ""
-                spark_check_port "$_port"   # re-run to print details
-                echo ""
-                echo "Fix: stop the process holding port ${_port}, or change SPARK_PORT"
-                echo "in ${_SPARK_CFG}/cluster.env and re-run."
-                exit 1
-            fi
+            # Auto-resolve port before starting services.
+            spark_resolve_port
 
             # ── [1/10] Pre-flight: SSH connectivity ──────────────────────────
             echo "[1/10] Pre-flight: verifying SSH connectivity to dyad..."

@@ -122,14 +122,7 @@ fi
 
 [[ -z "${MODEL_NAME:-}" ]] && spark_die "No model configured. Set MODEL_NAME in model.env or pass as argument."
 
-# Pre-flight: verify the API port is not already in use by another process.
-if ! spark_check_port "$(spark_effective_port)" 2>/dev/null; then
-    local_port="$(spark_effective_port)"
-    spark_check_port "$local_port"  # re-run to print the details to stderr
-    echo ""
-    echo "Fix: either stop the process holding port ${local_port}, or change SPARK_PORT"
-    echo "in ~/.config/spark-tools/cluster.env and re-run."
-    exit 1
-fi
+# Auto-resolve port: if the configured port is occupied, bump to the next free one.
+spark_resolve_port
 
 spark_dispatch serve "$@"

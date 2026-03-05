@@ -164,22 +164,48 @@ spark_effective_port() {
     fi
 }
 
-# --- Port availability check ---
+# --- Port availability ---
 # Returns 0 if the port is free, 1 if occupied.
-# When occupied, prints the process holding it to stderr.
-spark_check_port() {
-    local port="${1:-$(spark_effective_port)}"
-    local host="${2:-localhost}"
-    local holder
-    holder="$(ss -tlnp "sport = :${port}" 2>/dev/null | tail -n +2)"
-    if [[ -z "$holder" ]]; then
+spark_port_free() {
+    local port="$1"
+    [[ -z "$(ss -tlnp "sport = :${port}" 2>/dev/null | tail -n +2)" ]]
+}
+
+# Find a free port starting from the configured one, auto-incrementing if needed.
+# Updates SPARK_PORT (and cluster.env) when it has to bump.
+spark_resolve_port() {
+    local port="${SPARK_PORT:-8000}"
+    local max_tries=10
+    local original="$port"
+
+    if spark_port_free "$port"; then
         return 0
     fi
+
+    local holder
+    holder="$(ss -tlnp "sport = :${port}" 2>/dev/null | tail -n +2 | head -1)"
     local proc_info
     proc_info="$(echo "$holder" | grep -oP 'users:\(\("\K[^"]+' | head -1)"
-    echo "Port ${port} on ${host} is already in use by: ${proc_info:-unknown process}" >&2
-    echo "  ${holder}" >&2
-    return 1
+    spark_warn "Port ${port} in use by ${proc_info:-another process}, scanning for a free port..."
+
+    local i=1
+    while (( i < max_tries )); do
+        port=$(( original + i ))
+        if spark_port_free "$port"; then
+            spark_info "Using port ${port} instead of ${original}"
+            export SPARK_PORT="$port"
+            # Persist so subsequent commands (spark-check, proxy, etc.) use the same port.
+            local _cfg="${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}/cluster.env"
+            if [[ -f "$_cfg" ]]; then
+                sed -i "s/^SPARK_PORT=.*/SPARK_PORT=${port}/" "$_cfg"
+                spark_info "Updated SPARK_PORT=${port} in ${_cfg}"
+            fi
+            return 0
+        fi
+        (( i++ ))
+    done
+
+    spark_die "No free port found in range ${original}-${port}. Free a port or set SPARK_PORT manually."
 }
 
 # --- SSH helpers ---
