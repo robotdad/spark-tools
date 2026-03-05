@@ -120,6 +120,17 @@ TRT-LLM requires Docker Swarm + MPI. Use SPARK_MODE=swarm or SPARK_ENGINE=vllm."
     fi
 }
 
+# --- Topology ---
+# Read the current topology (split | cluster). Defaults to "cluster".
+spark_read_topology() {
+    local topo_file="${SPARK_CONFIG_DIR}/topology"
+    if [[ -f "$topo_file" ]]; then
+        cat "$topo_file"
+    else
+        echo "cluster"
+    fi
+}
+
 # --- Dispatch ---
 # Routes to the correct backend script: backends/{mode}/{action}.sh
 spark_dispatch() {

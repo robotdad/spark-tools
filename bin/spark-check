@@ -131,6 +131,9 @@ fi
 
 spark_load_config
 
+# Effective topology: split | cluster (from topology file, not SPARK_MODE)
+TOPOLOGY="$(spark_read_topology)"
+
 # ---------------------------------------------------------------------------
 # Check counters
 # ---------------------------------------------------------------------------
@@ -202,30 +205,30 @@ _ssh_reachable() {
 # ---------------------------------------------------------------------------
 echo ""
 _bold "=== Spark Cluster Health Check ==="
-printf "    Mode: %-10s Primary: %-10s Secondary: %s\n" \
-    "${SPARK_MODE}" "${SPARK_PRIMARY_HOST}" "${SPARK_SECONDARY_HOST}"
+printf "    Topology: %-10s Primary: %-10s Secondary: %s\n" \
+    "${TOPOLOGY}" "${SPARK_PRIMARY_HOST}" "${SPARK_SECONDARY_HOST}"
 echo ""
 
 # ---------------------------------------------------------------------------
 # SPLIT MODE
 # ---------------------------------------------------------------------------
-if [[ "$SPARK_MODE" == "split" ]]; then
+if [[ "$TOPOLOGY" == "split" ]]; then
 
     PORT="${SPARK_PORT:-8000}"
     PROXY_PORT="${SPARK_PROXY_PORT:-9000}"
 
     # --- Primary node services ---
     _bold "--- Services: ${SPARK_PRIMARY_HOST} (head) ---"
-    _svc_local "vllm-standalone  (${SPARK_PRIMARY_HOST})" "vllm-standalone"
-    _svc_local "vllm-proxy       (load balancer)"         "vllm-proxy"
-    _svc_local "open-webui"                               "open-webui"
+    _svc_local "spark-vllm-standalone  (${SPARK_PRIMARY_HOST})" "spark-vllm-standalone"
+    _svc_local "spark-proxy            (load balancer)"         "spark-proxy"
+    _svc_local "open-webui"                                     "open-webui"
     echo ""
 
     # --- Secondary node reachability + service ---
     _bold "--- Services: ${SPARK_SECONDARY_HOST} (worker) ---"
     if _ssh_reachable "$SPARK_SECONDARY_HOST"; then
-        _svc_remote "vllm-standalone  (${SPARK_SECONDARY_HOST})" \
-            "$SPARK_SECONDARY_HOST" "vllm-standalone"
+        _svc_remote "spark-vllm-standalone  (${SPARK_SECONDARY_HOST})" \
+            "$SPARK_SECONDARY_HOST" "spark-vllm-standalone"
     fi
     echo ""
 
@@ -253,7 +256,8 @@ if [[ "$SPARK_MODE" == "split" ]]; then
 # ---------------------------------------------------------------------------
 # RAY MODE
 # ---------------------------------------------------------------------------
-elif [[ "$SPARK_MODE" == "ray" ]]; then
+elif [[ "$TOPOLOGY" == "cluster" ]]; then
+    # Cluster topology uses Ray
 
     PORT="${SPARK_PORT:-8000}"
 
@@ -299,6 +303,7 @@ elif [[ "$SPARK_MODE" == "ray" ]]; then
 # SWARM MODE
 # ---------------------------------------------------------------------------
 elif [[ "$SPARK_MODE" == "swarm" ]]; then
+    # Swarm orchestration (no separate topology — swarm manages its own layout)
 
     PORT="$(spark_effective_port)"
 
@@ -344,8 +349,8 @@ elif [[ "$SPARK_MODE" == "swarm" ]]; then
 # UNKNOWN MODE
 # ---------------------------------------------------------------------------
 else
-    _yellow "  ~ Unknown SPARK_MODE: '${SPARK_MODE}'"
-    _yellow "    Expected: split | ray | swarm"
+    _yellow "  ~ Unknown topology/mode: TOPOLOGY='${TOPOLOGY}' SPARK_MODE='${SPARK_MODE}'"
+    _yellow "    Expected topology: split | cluster   Expected mode: swarm | ray"
     WARN=$(( WARN + 1 ))
 fi
 

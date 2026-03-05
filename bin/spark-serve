@@ -125,4 +125,18 @@ fi
 # Auto-resolve port: if the configured port is occupied, bump to the next free one.
 spark_resolve_port
 
+# Split topology manages standalone systemd units directly — no backend dispatch.
+if [[ "$(spark_read_topology)" == "split" ]]; then
+    spark_info "Starting split-mode services..."
+    sudo systemctl start spark-vllm-standalone
+    spark_ssh "${SPARK_SECONDARY_HOST:-dyad}" \
+        "sudo systemctl start spark-vllm-standalone"
+    sudo systemctl restart spark-proxy 2>/dev/null || true
+    echo ""
+    spark_info "Split-mode services started."
+    echo "  monad → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
+    echo "  dyad  → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
+    exit 0
+fi
+
 spark_dispatch serve "$@"

@@ -96,4 +96,16 @@ EOF
 fi
 
 spark_load_config
+
+# Split topology manages standalone systemd units directly — no backend dispatch.
+if [[ "$(spark_read_topology)" == "split" ]]; then
+    spark_info "Stopping split-mode services..."
+    sudo systemctl stop spark-vllm-standalone 2>/dev/null || true
+    sudo systemctl stop spark-proxy 2>/dev/null || true
+    spark_ssh "${SPARK_SECONDARY_HOST:-dyad}" \
+        "sudo systemctl stop spark-vllm-standalone" 2>/dev/null || true
+    spark_info "Split-mode services stopped."
+    exit 0
+fi
+
 spark_dispatch stop "$@"
