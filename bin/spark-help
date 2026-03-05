@@ -466,6 +466,86 @@ Hardware:
          Carries: NCCL all-reduce (Ray/vLLM) and MPI collectives (TRT-LLM)
 MODES
 
+cat <<CONNECT
+
+================================================================
+CONNECTING TO THE CLUSTER
+================================================================
+
+The cluster exposes an OpenAI-compatible API. Any tool that speaks the
+OpenAI chat completions protocol can connect — Amplifier, curl, Python
+openai library, etc.
+
+Endpoints:
+  Direct (no auth):  http://monad:${SPARK_PORT:-8000}/v1
+                     http://dyad:${SPARK_PORT:-8000}/v1
+  Via proxy (auth):  http://monad:9000/v1
+
+The proxy load-balances across both nodes and requires a bearer token.
+The token lives in: ~/.config/vllm-proxy/secret.env
+  To read it:  cat ~/.config/vllm-proxy/secret.env | grep VLLM_PROXY_SECRET
+
+Model name for API requests:
+  \${SERVED_MODEL_NAME:-\$MODEL_NAME}
+  Currently: ${SERVED_MODEL_NAME:-$MODEL_NAME}
+
+--- Amplifier (vLLM provider) ---
+
+Add to your bundle or profile YAML:
+
+  providers:
+    - module: provider-vllm
+      config:
+        base_url: http://monad:9000/v1      # proxy (recommended)
+        api_key: <token from secret.env>     # required when using proxy
+        model: ${SERVED_MODEL_NAME:-$MODEL_NAME}
+
+Or without the proxy (direct to one node, no auth):
+
+  providers:
+    - module: provider-vllm
+      config:
+        base_url: http://monad:${SPARK_PORT:-8000}/v1
+        api_key: none
+        model: ${SERVED_MODEL_NAME:-$MODEL_NAME}
+
+--- curl ---
+
+  curl http://monad:${SPARK_PORT:-8000}/v1/chat/completions \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "model": "${SERVED_MODEL_NAME:-$MODEL_NAME}",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+
+  # Via proxy (add auth header):
+  curl http://monad:9000/v1/chat/completions \\
+    -H "Content-Type: application/json" \\
+    -H "Authorization: Bearer <token>" \\
+    -d '{ ... }'
+
+--- Python (openai library) ---
+
+  from openai import OpenAI
+  client = OpenAI(
+      base_url="http://monad:${SPARK_PORT:-8000}/v1",
+      api_key="none",       # direct; use token for proxy on :9000
+  )
+  r = client.chat.completions.create(
+      model="${SERVED_MODEL_NAME:-$MODEL_NAME}",
+      messages=[{"role": "user", "content": "Hello"}],
+  )
+  print(r.choices[0].message.content)
+
+--- Verify connectivity ---
+
+  curl -s http://monad:${SPARK_PORT:-8000}/v1/models | python3 -m json.tool
+  curl -s http://dyad:${SPARK_PORT:-8000}/v1/models  | python3 -m json.tool
+  curl -s -H "Authorization: Bearer <token>" http://monad:9000/v1/models
+
+CONNECT
+
 cat <<'TROUBLESHOOT'
 
 ================================================================
