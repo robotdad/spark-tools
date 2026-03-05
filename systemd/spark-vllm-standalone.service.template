@@ -25,7 +25,12 @@ ExecStartPre=-/usr/bin/docker rm -f spark-vllm
 ExecStartPre=/usr/bin/bash -c 'sync && echo 3 > /proc/sys/vm/drop_caches || true'
 
 # ── Main ───────────────────────────────────────────────────────────────────
-ExecStart=/usr/bin/bash -c 'docker run \
+# Strip --enforce-eager from VLLM_EXTRA_ARGS at runtime.
+# It is only needed for multi-node TP=2 (Triton allocator crash); standalone
+# is always TP=1 where CUDA graphs work fine and give ~25-30% better throughput.
+ExecStart=/usr/bin/bash -c '\
+  VLLM_EXTRA_ARGS="$(echo $VLLM_EXTRA_ARGS | sed "s/--enforce-eager//g")"; \
+  docker run \
   --name spark-vllm \
   --network host \
   --gpus all \
