@@ -5,8 +5,12 @@
 # Repo root (parent of lib/)
 SPARK_TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Config paths
-SPARK_CONFIG_DIR="${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}"
+# Config paths — resolve the real operator's home under sudo
+_SPARK_HOME="${HOME}"
+if [[ -n "${SUDO_USER:-}" ]]; then
+    _SPARK_HOME="$(eval echo "~${SUDO_USER}")"
+fi
+SPARK_CONFIG_DIR="${SPARK_CONFIG_DIR:-${_SPARK_HOME}/.config/spark-tools}"
 SPARK_CLUSTER_ENV="${SPARK_CONFIG_DIR}/cluster.env"
 SPARK_MODEL_ENV="${SPARK_CONFIG_DIR}/model.env"
 
@@ -206,7 +210,7 @@ spark_resolve_port() {
             spark_info "Using port ${port} instead of ${original}"
             export SPARK_PORT="$port"
             # Persist so subsequent commands (spark-check, proxy, etc.) use the same port.
-            local _cfg="${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}/cluster.env"
+            local _cfg="${SPARK_CONFIG_DIR}/cluster.env"
             if [[ -f "$_cfg" ]]; then
                 sed -i "s/^SPARK_PORT=.*/SPARK_PORT=${port}/" "$_cfg"
                 spark_info "Updated SPARK_PORT=${port} in ${_cfg}"
