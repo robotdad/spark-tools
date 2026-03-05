@@ -734,6 +734,34 @@ else
     info "transparent_hugepage: sysfs path not found, skipping"
 fi
 
+# --- Sudoers: passwordless systemctl for spark services ---
+# Allows the operator (and AI agent sessions) to manage spark services
+# without entering a password for every systemctl command.
+SUDOERS_SRC="${SCRIPT_DIR}/config/sudoers-spark-tools"
+SUDOERS_DST="/etc/sudoers.d/spark-tools"
+if [[ -f "$SUDOERS_SRC" ]]; then
+    if [[ -f "$SUDOERS_DST" ]]; then
+        info "sudoers drop-in already installed at ${SUDOERS_DST}"
+    else
+        info "Installing sudoers drop-in for passwordless spark service management"
+        if [[ "$DRY_RUN" == false ]]; then
+            sudo cp "$SUDOERS_SRC" "$SUDOERS_DST"
+            sudo chmod 0440 "$SUDOERS_DST"
+            # Validate — if visudo rejects it, remove immediately.
+            if ! sudo visudo -c -f "$SUDOERS_DST" >/dev/null 2>&1; then
+                warn "sudoers file failed validation — removing to avoid lockout"
+                sudo rm -f "$SUDOERS_DST"
+            else
+                info "Installed ${SUDOERS_DST} (passwordless systemctl for spark-* services)"
+            fi
+        else
+            info "[dry-run] cp ${SUDOERS_SRC} ${SUDOERS_DST}"
+        fi
+    fi
+else
+    warn "sudoers template not found at ${SUDOERS_SRC}, skipping"
+fi
+
 #-----------------------------------------------------------------------------
 # [8/8] /etc/hosts + Systemd Reload
 #-----------------------------------------------------------------------------

@@ -1,0 +1,15 @@
+# Passwordless systemctl for spark-tools services.
+# Install: sudo cp config/sudoers-spark-tools /etc/sudoers.d/spark-tools
+#          sudo chmod 0440 /etc/sudoers.d/spark-tools
+#
+# This allows the operator to manage spark services without entering a
+# password every time, and — critically — lets AI agent sessions operate
+# the cluster autonomously.
+
+# Spark vLLM / Ray / Swarm service management
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl start spark-*
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop spark-*
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart spark-*
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable spark-*
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable spark-*
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
