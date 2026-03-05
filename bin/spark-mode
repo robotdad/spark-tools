@@ -340,6 +340,12 @@ case "${1:-}" in
         _save_topology() {
             mkdir -p "${_SPARK_CFG}"
             echo "$1" > "${_TOPOLOGY_FILE}"
+            # Keep SPARK_MODE in cluster.env in sync so spark-help
+            # and other tools render the correct mode-specific info.
+            local _cluster_env="${_SPARK_CFG}/cluster.env"
+            if [[ -f "${_cluster_env}" ]]; then
+                sed -i "s/^SPARK_MODE=.*/SPARK_MODE=$1/" "${_cluster_env}"
+            fi
         }
 
         # ── status ────────────────────────────────────────────────────────────
