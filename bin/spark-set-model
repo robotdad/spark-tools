@@ -372,7 +372,7 @@ if [[ "$SPARK_MODE" == "split" ]]; then
     # -----------------------------------------------------------------------
     echo "==> [4/4] Restarting vllm-standalone on ${SECONDARY}..."
 
-    if spark_ssh "$SECONDARY" "sudo systemctl restart vllm-standalone" 2>/dev/null; then
+    if spark_ssh_tty "$SECONDARY" "sudo systemctl restart vllm-standalone" 2>/dev/null; then
         echo "  ✓ vllm-standalone restarted on ${SECONDARY}"
     else
         _yellow "  WARNING: Could not restart vllm-standalone on ${SECONDARY}"

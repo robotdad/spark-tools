@@ -320,9 +320,13 @@ case "${1:-}" in
                 "$template"
         }
 
-        # SSH wrapper targeting dyad.
+        # SSH wrappers targeting dyad.
         _ssh_dyad() {
             spark_ssh "${_DYAD}" "$@"
+        }
+        # With TTY — use for remote sudo commands (not piped input).
+        _ssh_dyad_tty() {
+            spark_ssh_tty "${_DYAD}" "$@"
         }
 
         _current_topology() {
@@ -449,8 +453,8 @@ case "${1:-}" in
 
             # ── [4/10] Stop cluster services on dyad ─────────────────────────
             echo "[4/10] Stopping cluster services on dyad..."
-            _ssh_dyad "sudo systemctl stop spark-ray-worker    2>/dev/null || true; \
-                       sudo systemctl disable spark-ray-worker 2>/dev/null || true"
+            _ssh_dyad_tty "sudo systemctl stop spark-ray-worker    2>/dev/null || true; \
+                          sudo systemctl disable spark-ray-worker 2>/dev/null || true"
 
             # ── [5/10] Remove stale containers on both nodes ─────────────────
             echo "[5/10] Removing stale containers on both nodes..."
@@ -478,7 +482,8 @@ case "${1:-}" in
             # ── [8/10] Install standalone service on dyad ────────────────────
             echo "[8/10] Installing spark-vllm-standalone.service on dyad..."
             _process_template "${_TEMPLATE_DIR}/spark-vllm-standalone.service.template" \
-                | _ssh_dyad "sudo tee /etc/systemd/system/spark-vllm-standalone.service > /dev/null"
+                | _ssh_dyad "cat > /tmp/.spark-service-tmp"
+            _ssh_dyad_tty "sudo mv /tmp/.spark-service-tmp /etc/systemd/system/spark-vllm-standalone.service"
 
             # ── [9/10] Sync config files to dyad ─────────────────────────────
             echo "[9/10] Syncing model.env + node.env to dyad..."
@@ -501,12 +506,12 @@ case "${1:-}" in
             # ── [10/10] Enable + start services; save topology ────────────────
             echo "[10/10] Enabling and starting services on both nodes..."
             systemctl daemon-reload
-            _ssh_dyad "sudo systemctl daemon-reload"
+            _ssh_dyad_tty "sudo systemctl daemon-reload"
 
             systemctl enable spark-vllm-standalone
             systemctl start  spark-vllm-standalone
-            _ssh_dyad "sudo systemctl enable spark-vllm-standalone; \
-                       sudo systemctl start  spark-vllm-standalone"
+            _ssh_dyad_tty "sudo systemctl enable spark-vllm-standalone; \
+                           sudo systemctl start  spark-vllm-standalone"
 
             # Restart proxy if it is already running
             systemctl restart spark-proxy 2>/dev/null || true
@@ -539,8 +544,8 @@ case "${1:-}" in
 
             # ── [2/9] Stop standalone on dyad ────────────────────────────────
             echo "[2/9] Stopping standalone services on dyad..."
-            _ssh_dyad "sudo systemctl stop    spark-vllm-standalone 2>/dev/null || true; \
-                       sudo systemctl disable spark-vllm-standalone 2>/dev/null || true"
+            _ssh_dyad_tty "sudo systemctl stop    spark-vllm-standalone 2>/dev/null || true; \
+                          sudo systemctl disable spark-vllm-standalone 2>/dev/null || true"
 
             # ── [3/9] Remove stale containers on both nodes ──────────────────
             echo "[3/9] Removing stale containers on both nodes..."
@@ -562,20 +567,21 @@ case "${1:-}" in
             # ── [6/9] Install Ray worker service on dyad ─────────────────────
             echo "[6/9] Installing spark-ray-worker.service on dyad..."
             _process_template "${_TEMPLATE_DIR}/spark-ray-worker.service.template" \
-                | _ssh_dyad "sudo tee /etc/systemd/system/spark-ray-worker.service > /dev/null"
+                | _ssh_dyad "cat > /tmp/.spark-service-tmp"
+            _ssh_dyad_tty "sudo mv /tmp/.spark-service-tmp /etc/systemd/system/spark-ray-worker.service"
 
             # ── [7/9] Start Ray cluster ───────────────────────────────────────
             echo "[7/9] Starting Ray cluster..."
             systemctl daemon-reload
-            _ssh_dyad "sudo systemctl daemon-reload"
+            _ssh_dyad_tty "sudo systemctl daemon-reload"
 
             systemctl enable spark-ray-head
             systemctl start  spark-ray-head
             spark_info "Waiting 5s for Ray head to initialise..."
             sleep 5
 
-            _ssh_dyad "sudo systemctl enable spark-ray-worker; \
-                       sudo systemctl start  spark-ray-worker"
+            _ssh_dyad_tty "sudo systemctl enable spark-ray-worker; \
+                           sudo systemctl start  spark-ray-worker"
             spark_info "Waiting 10s for Ray worker to join..."
             sleep 10
 

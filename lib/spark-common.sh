@@ -164,7 +164,7 @@ spark_effective_port() {
     fi
 }
 
-# --- SSH helper ---
+# --- SSH helpers ---
 # When running under sudo, drop back to the real operator so SSH can
 # access their ~/.ssh/ keys and agent socket (root has neither).
 spark_ssh() {
@@ -174,5 +174,17 @@ spark_ssh() {
         sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
     else
         ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
+    fi
+}
+
+# SSH with TTY allocation — use for commands that need remote sudo
+# when the remote user may not have NOPASSWD.  Do NOT use for piped input.
+spark_ssh_tty() {
+    local host="$1"
+    shift
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        sudo -u "$SUDO_USER" ssh -t -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
+    else
+        ssh -t -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
     fi
 }
