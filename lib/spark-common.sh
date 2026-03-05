@@ -164,6 +164,24 @@ spark_effective_port() {
     fi
 }
 
+# --- Port availability check ---
+# Returns 0 if the port is free, 1 if occupied.
+# When occupied, prints the process holding it to stderr.
+spark_check_port() {
+    local port="${1:-$(spark_effective_port)}"
+    local host="${2:-localhost}"
+    local holder
+    holder="$(ss -tlnp "sport = :${port}" 2>/dev/null | tail -n +2)"
+    if [[ -z "$holder" ]]; then
+        return 0
+    fi
+    local proc_info
+    proc_info="$(echo "$holder" | grep -oP 'users:\(\("\K[^"]+' | head -1)"
+    echo "Port ${port} on ${host} is already in use by: ${proc_info:-unknown process}" >&2
+    echo "  ${holder}" >&2
+    return 1
+}
+
 # --- SSH helpers ---
 # When running under sudo, drop back to the real operator so SSH can
 # access their ~/.ssh/ keys and agent socket (root has neither).
