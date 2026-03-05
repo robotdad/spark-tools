@@ -5,16 +5,91 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-stop [options]"
-    echo ""
-    echo "Stop the currently running inference services."
-    echo ""
-    echo "In swarm+trtllm mode, supports:"
-    echo "  --kill-only    Kill server processes only (default)"
-    echo "  --stack        Also remove the Docker stack"
-    echo "  --swarm        Also leave the Swarm"
-    echo ""
-    echo "In ray mode: stops Ray head/worker services and vLLM."
+    cat <<'EOF'
+spark-stop — Stop all running inference services on the Spark cluster
+
+Tears down the inference stack according to the current SPARK_MODE. Use this
+when reconfiguring the model, switching modes, freeing GPU memory, or shutting
+down for maintenance. spark-reset calls spark-stop automatically before
+restarting, so you rarely need to run this directly unless you want to stop
+without immediately restarting.
+
+In swarm mode three levels of teardown are available via flags, ranging from
+fast (kill processes only) to complete (leave the Swarm). In ray mode no
+flags are accepted; all Ray and vLLM services are stopped uniformly.
+
+Usage:
+  spark-stop [--kill-only | --stack | --swarm]
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists  (run spark-init to create it)
+  - Services need not be running; spark-stop is safe to call on an idle or
+    partially-failed cluster
+  - ray + trtllm is not a valid combination and is rejected before any stop
+    action is taken
+
+Options (swarm mode only; ignored or unavailable in ray mode):
+  (none)        Same as --kill-only; this is the default.
+
+  --kill-only   Kill inference server processes only. The Docker stack 'spark'
+                and Swarm membership remain intact. Fastest option — use when
+                you just want to restart the model. This is the path taken by
+                spark-reset.
+
+  --stack       Kill inference processes AND remove the Docker stack ('spark')
+                from the Swarm. Swarm membership is preserved. Use before
+                redeploying with a changed stack configuration. The next
+                spark-serve will redeploy the stack from scratch, which is
+                slower than --kill-only.
+
+  --swarm       Kill inference processes, remove the Docker stack, AND issue
+                'docker swarm leave --force' on all nodes. Full teardown.
+                Swarm must be re-initialized (via spark-init or manually)
+                before spark-serve will work again. Use when changing Swarm
+                topology, node membership, or the QSFP network configuration.
+
+  In ray mode: stops vllm-ray-head and vllm (on monad), then SSHs to dyad to
+  stop vllm-ray-worker. SSH uses ConnectTimeout=5s; a timeout is reported as
+  a failure but does not prevent local services from being stopped.
+
+Behavior:
+  1. Loads config (cluster.env → model.env → node.env overrides)
+  2. Validates SPARK_MODE and SPARK_ENGINE; exits 1 on invalid combination
+  3. Execs backends/${SPARK_MODE}/stop.sh with the provided flags — spark-stop
+     does not return; all output and exit code come from the backend
+
+  On success: services are stopped; GPU memory is freed. In-flight requests
+              are interrupted without connection draining.
+  On failure: backend exits non-zero; partial stop is possible. Running
+              spark-stop again is safe. spark-reset ignores stop failures,
+              so it is the preferred recovery path when stop itself is broken.
+
+Examples:
+  # Default: kill inference processes, keep Docker stack and Swarm intact
+  spark-stop
+
+  # Remove the Docker stack too (useful before changing stack config)
+  spark-stop --stack
+
+  # Full teardown — leave the Swarm entirely
+  spark-stop --swarm
+
+  # Confirm all services are down after stopping
+  spark-check
+
+Exit codes:
+  0   Stop completed successfully
+  1   Configuration error (missing cluster.env, invalid mode/engine
+      combination) or backend script missing/not executable; partial stop
+      output may appear before the error
+
+See also:
+  spark-serve      Restart inference after stopping
+  spark-reset      Stop + restart in one command (tolerates stop failures)
+  spark-check      Verify services are actually down after stopping
+  spark-status     Backend service and container status
+  spark-help       Comprehensive quick reference for all spark-tools commands
+EOF
     exit 0
 fi
 

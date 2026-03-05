@@ -5,14 +5,111 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-bench [runs] [max_tokens]"
-    echo ""
-    echo "Benchmark the running inference endpoint."
-    echo "Works with any engine (uses OpenAI-compatible API)."
-    echo ""
-    echo "Arguments:"
-    echo "  runs         Number of benchmark runs (default: 3)"
-    echo "  max_tokens   Max tokens per response (default: 256)"
+    cat <<'EOF'
+spark-bench — benchmark the running inference endpoint
+
+Sends a series of chat-completion requests to the local inference service and
+reports per-run and aggregate latency (seconds) and token throughput (tok/s).
+Works with any engine — uses the OpenAI-compatible /v1/chat/completions API.
+
+WHY: Provides a quick, zero-dependency sanity check that the model is responding
+and establishes baseline throughput numbers for comparing models, TP sizes, and
+engine configurations without installing external benchmarking tools or a Python
+environment.
+
+Usage:
+  spark-bench [RUNS] [MAX_TOKENS]
+
+Arguments:
+  RUNS         Number of sequential requests to send.
+               Default: 3. Use 10 or more for a statistically stable average.
+
+  MAX_TOKENS   Maximum completion tokens the model may generate per request.
+               Default: 256. Higher values stress generation throughput but
+               increase wall-clock time per run. Lower values emphasise
+               time-to-first-token (prefill) latency.
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env and model.env must exist.
+    Run 'spark-init' first if they do not.
+  - MODEL_NAME must be set in model.env.
+  - The inference service must be running and healthy:
+      spark-status    — check service health
+      spark-serve     — start the service if it is not running
+  - curl must be available in PATH.
+
+Endpoint:
+  Sends POST http://localhost:PORT/v1/chat/completions (non-streaming).
+  PORT is selected automatically by engine:
+    trtllm  →  TRTLLM_PORT from model.env  (default: 8355)
+    vllm    →  SPARK_PORT  from cluster.env (default: 8000)
+
+Prompt used per run:
+  "Benchmark run N for MODEL on DGX Spark. Please reply with a short sentence."
+  Intentionally short so generation time dominates over prefill time.
+
+Output — per run:
+  Run 1/3 ...
+    Latency: 2.847s     wall-clock time from first byte sent to last byte received
+    Tokens:  48         completion_tokens field from the response JSON
+    Tok/s:   16.86      tokens / latency for this individual run
+
+Output — summary block:
+  === Summary ===
+  Effective runs: 3     runs that returned a valid (non-empty) response
+  Total time:     8.532 s
+  Total tokens:   144
+  Avg latency:    2.844 s
+  Avg tokens/s:   16.87
+
+Interpreting results:
+  Avg latency  < 5 s at 256 tokens  →  service is healthy and responsive
+  Avg tokens/s > 15                 →  normal range for a 235B FP4 model on
+                                       two DGX Sparks with TP_SIZE=2
+  "Empty or failed response"        →  service not running, wrong port, or
+                                       model still loading; run spark-status
+  Avg tokens/s much lower than 10   →  check TP_SIZE in model.env and GPU
+                                       memory utilisation (docker stats)
+
+Exit codes:
+  0  Benchmark completed (even if some individual runs returned errors).
+  1  cluster.env or model.env missing, or MODEL_NAME not set.
+
+Examples:
+  # Quick 3-run benchmark with default settings:
+  spark-bench
+
+  # 10-run benchmark for a more stable average:
+  spark-bench 10
+
+  # Stress longer-form generation (512 max tokens, 5 runs):
+  spark-bench 5 512
+
+  # Confirm service is up before benchmarking:
+  spark-status && spark-bench
+
+  # Expected output (healthy two-node system, Qwen3-235B-FP4):
+  #   === TRT-LLM benchmark ===
+  #   Model:      nvidia/Qwen3-235B-A22B-FP4
+  #   Port:       8355
+  #   Runs:       3
+  #   Max tokens: 256
+  #
+  #   Run 1/3 ...
+  #     Latency: 2.847s
+  #     Tokens:  48
+  #     Tok/s:   16.86
+  #   ...
+  #   === Summary ===
+  #   Avg latency:    2.844 s
+  #   Avg tokens/s:   16.87
+
+See also:
+  spark-status    check service health before benchmarking
+  spark-serve     start the inference service
+  spark-set-model change the active model
+  spark-help      full command reference
+EOF
     exit 0
 fi
 

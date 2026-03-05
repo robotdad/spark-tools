@@ -1,0 +1,50 @@
+[Unit]
+Description=Spark vLLM Standalone Server (split-node mode, TP=1 per node)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User={{USERNAME}}
+WorkingDirectory=/home/{{USERNAME}}
+
+# ── Config load order ─────────────────────────────────────────────────────
+# cluster.env is NOT loaded here — only model + node overrides.
+# Load order: model.env → node.env  (later file wins on any key it defines)
+# System-level paths are optional (-); user-level paths are authoritative.
+EnvironmentFile=-/etc/spark-tools/model.env
+EnvironmentFile=/home/{{USERNAME}}/.config/spark-tools/model.env
+EnvironmentFile=-/etc/spark-tools/node.env
+EnvironmentFile=-/home/{{USERNAME}}/.config/spark-tools/node.env
+
+# ── Pre-start ──────────────────────────────────────────────────────────────
+# Remove any stale container from a previous run.
+ExecStartPre=-/usr/bin/docker rm -f spark-vllm
+# Drop OS page cache to free memory before loading model weights.
+# Requires root; the || true makes it non-fatal when running as a normal user.
+ExecStartPre=/usr/bin/bash -c 'sync && echo 3 > /proc/sys/vm/drop_caches || true'
+
+# ── Main ───────────────────────────────────────────────────────────────────
+ExecStart=/usr/bin/bash -c 'docker run \
+  --name spark-vllm \
+  --network host \
+  --gpus all \
+  --shm-size 10.24g \
+  -v /home/{{USERNAME}}/.cache/huggingface:/root/.cache/huggingface \
+  -e VLLM_FLASHINFER_MOE_BACKEND=latency \
+  {{VLLM_IMAGE}} \
+  vllm serve "$MODEL_NAME" \
+    --tensor-parallel-size "$TP_SIZE" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --port {{PORT}} \
+    $VLLM_EXTRA_ARGS \
+    --host 0.0.0.0'
+
+ExecStop=/usr/bin/docker stop spark-vllm
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -5,22 +5,108 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-serve [model] [options]"
-    echo ""
-    echo "Start serving the configured model using the current mode and engine."
-    echo ""
-    echo "Arguments:"
-    echo "  model          Override MODEL_NAME from config (optional)"
-    echo ""
-    echo "The model, port, and engine settings come from:"
-    echo "  ~/.config/spark-tools/cluster.env  (mode, engine, port)"
-    echo "  ~/.config/spark-tools/model.env    (model, parallelism)"
-    echo ""
-    echo "Examples:"
-    echo "  spark-serve                                    # serve configured model"
-    echo "  spark-serve nvidia/Qwen3-14B-FP4              # override model"
-    echo ""
-    echo "See also: spark-mode, spark-set-model, spark-status"
+    cat <<'EOF'
+spark-serve — Start serving a configured LLM model on the Spark cluster
+
+Loads the current mode/engine/model configuration and launches the full
+inference stack across monad (head) and dyad (worker), connected via the
+QSFP fabric (enp1s0f0np0). This is the primary "bring inference up" command.
+Run it after spark-init has configured the cluster and model.env specifies
+what to serve.
+
+On success the model is reachable via an OpenAI-compatible API at the
+configured port. Model loading takes time after the process starts — use
+spark-check to poll readiness and confirm the endpoint is live.
+
+Usage:
+  spark-serve [model]
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists  (run spark-init to create it)
+  - MODEL_NAME is set in ~/.config/spark-tools/model.env  OR  passed as the
+    positional argument below; spark-serve exits with an error if neither is
+    present after all config sources are loaded
+  - SPARK_MODE is 'swarm' or 'ray'  (set via spark-mode or cluster.env)
+  - swarm mode:  Docker Swarm must be initialized; dyad must be a Swarm member
+  - ray mode:    dyad must be reachable via SSH; vllm-ray-worker systemd unit
+                 must be installed on dyad
+  - ray + trtllm is not supported and is rejected at startup; TRT-LLM requires
+    Docker Swarm + MPI — use SPARK_MODE=swarm or SPARK_ENGINE=vllm
+
+Arguments:
+  model    Optional. HuggingFace model ID or local path that overrides
+           MODEL_NAME from model.env for this invocation only. Must be the
+           first argument and must not start with '-'. Does not modify
+           model.env on disk.
+           Example: spark-serve nvidia/Qwen3-14B-FP4
+
+Configuration (loaded in order; later values override earlier ones):
+  ~/.config/spark-tools/cluster.env          SPARK_MODE, SPARK_ENGINE,
+                                             SPARK_PRIMARY_HOST, SPARK_PORT
+  ~/.config/spark-tools/model.env            MODEL_NAME, TP_SIZE,
+                                             MAX_MODEL_LEN, GPU_MEM_UTIL
+  /etc/spark-tools/node.env                  system-level node override
+  ~/.config/spark-tools/node.env             user-level generic override
+  ~/.config/spark-tools/node.env.<hostname>  host-specific override
+                                             (e.g. node.env.monad, node.env.dyad)
+
+  Key variables:
+    SPARK_MODE          swarm | ray
+    SPARK_ENGINE        trtllm | vllm
+    SPARK_PRIMARY_HOST  head node hostname         (default: current hostname)
+    SPARK_PORT          OpenAI API listen port     (default: 8000)
+    TRTLLM_PORT         TRT-LLM engine port        (default: 8355, swarm only)
+    MODEL_NAME          HuggingFace ID or local path
+    TP_SIZE             tensor-parallel degree      (default: 2)
+    MAX_MODEL_LEN       maximum context length      (default: 32768)
+    GPU_MEM_UTIL        GPU memory fraction         (default: 0.85)
+
+Behavior:
+  1. Loads config chain (cluster.env → model.env → node.env overrides)
+  2. Validates SPARK_MODE and SPARK_ENGINE; exits 1 on invalid combination
+  3. Applies optional CLI model override to MODEL_NAME
+  4. Exits 1 if MODEL_NAME is still unset after all sources are checked
+  5. Execs backends/${SPARK_MODE}/serve.sh — spark-serve does not return;
+     all subsequent output and exit code come from the backend
+
+  API endpoint once serving:
+    vllm  (ray or swarm):   http://monad:${SPARK_PORT}/v1      (default :8000)
+    trtllm (swarm only):    http://monad:${TRTLLM_PORT}/v1     (default :8355)
+
+  On success: the backend starts containers/services; the process does not
+              return until the backend exits or is signalled.
+  On failure: the backend exits non-zero; common causes are model not found
+              on disk or HuggingFace, GPU OOM (reduce GPU_MEM_UTIL or TP_SIZE),
+              Swarm not initialized, or dyad unreachable via SSH.
+
+Examples:
+  # Serve the model configured in model.env
+  spark-serve
+
+  # Override the model for this run only (model.env is unchanged)
+  spark-serve nvidia/Qwen3-14B-FP4
+
+  # Check readiness after starting (run in a separate shell)
+  spark-check
+
+  # See current mode and model before starting
+  spark-help
+
+Exit codes:
+  0   Backend serve script exec'd successfully (model may still be loading;
+      use spark-check to confirm the endpoint is live and model has loaded)
+  1   Configuration error: missing cluster.env, invalid mode/engine
+      combination, MODEL_NAME not set, or backend script missing/not executable
+
+See also:
+  spark-stop       Stop running inference services
+  spark-reset      Stop then restart in one command
+  spark-check      Verify the endpoint is live and model has loaded
+  spark-status     Detailed backend service and container status
+  spark-set-model  Update MODEL_NAME and parallelism settings in model.env
+  spark-mode       Show or switch between swarm and ray modes
+  spark-help       Comprehensive quick reference for all spark-tools commands
+EOF
     exit 0
 fi
 

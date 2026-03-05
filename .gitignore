@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit actual secrets
+secret.env
+*.secret
+.env
+*.env.local
+
+# Generated runtime configs — use config/*.example as source of truth
+# ~/.config/spark-tools/ lives outside the repo; nothing to ignore here
+# But guard against anyone copying live configs into the repo tree:
+cluster.env
+model.env
+node.env.monad
+node.env.dyad
+node.env.*[!e][!x][!a][!m][!p][!l][!e]
+
+# Generated service files — commit only *.service.template
+# Actual .service files are installed to /etc/systemd/system/ by install.sh
+systemd/*.service
+!systemd/*.service.template
+
+# Log / temp files
+*.log
+*.tmp
+*.bak
+
+# Proxy venv (install locally, don't commit)
+proxy/venv/
+proxy/.venv/
+
+# HuggingFace cache (never in repo)
+.cache/

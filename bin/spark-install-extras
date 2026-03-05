@@ -5,15 +5,81 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-install-extras [--motd] [--proxy] [--symlinks] [--all]"
-    echo ""
-    echo "Install optional components."
-    echo ""
-    echo "Options:"
-    echo "  --motd       Install login banner to /etc/motd (requires sudo)"
-    echo "  --proxy      Initialize auth proxy secret"
-    echo "  --symlinks   Create /usr/local/bin symlinks for spark-* commands"
-    echo "  --all        Install everything"
+    cat <<'EOF'
+spark-install-extras — install optional system-integration components
+
+Installs components that improve day-to-day usability of the spark cluster.
+At least one flag is required; use --all to install everything in one step.
+
+WHY: The core spark-tools installer sets up config and systemd services. These
+extras go further: symlinks make spark-* commands available system-wide to all
+users without PATH changes; the MOTD greets operators with node role and key
+commands; the proxy secret enables bearer-token authentication on the inference
+API endpoint.
+
+Usage:
+  spark-install-extras [--motd] [--proxy] [--symlinks] [--all]
+
+Options:
+  --motd       Render config/motd.template substituting {{PRIMARY_HOST}} and
+               {{SECONDARY_HOST}} from cluster.env, then write the result to
+               /etc/motd (requires sudo). The banner is shown at every SSH
+               login and displays the cluster name, node roles, and common
+               commands. Overwrites /etc/motd unconditionally.
+
+  --proxy      Initialize (or rotate) the auth-proxy bearer-token secret by
+               running scripts/rotate-proxy-secret.sh. The secret is written
+               to ~/.config/vllm-proxy/secret.env and read by the spark-proxy
+               systemd service to gate API access. Does not require sudo.
+               WARNING: rotating the secret invalidates existing client tokens.
+
+  --symlinks   Create /usr/local/bin/spark-* → <spark-tools>/bin/spark-*
+               symlinks for every spark-* command in bin/ (requires sudo).
+               Uses 'sudo ln -sf' — safe to re-run; existing symlinks are
+               overwritten. After this, all spark-* commands are on the system
+               PATH for every user without any profile changes.
+
+  --all        Equivalent to --motd --proxy --symlinks. Installs all three
+               components in the order listed above.
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env must exist. Run 'spark-init' first.
+  - --motd and --symlinks require sudo access.
+  - --proxy requires scripts/rotate-proxy-secret.sh to be present in the repo.
+
+Side effects:
+  --motd:     Overwrites /etc/motd unconditionally on every run.
+  --proxy:    Writes ~/.config/vllm-proxy/secret.env (creates the directory if
+              needed). Existing secret is replaced — old client tokens break.
+  --symlinks: Uses 'sudo ln -sf' — overwrites any existing symlinks. Safe to
+              re-run after updating the spark-tools repo.
+
+Exit codes:
+  0  All requested components installed successfully.
+  1  No options specified, unknown option, or cluster.env not found.
+
+Examples:
+  # Full setup — install all extras in one step (typical first-run on head):
+  spark-install-extras --all
+
+  # Create system-wide PATH symlinks only (no MOTD or proxy changes):
+  spark-install-extras --symlinks
+
+  # Initialize or rotate the auth proxy secret (no sudo needed):
+  spark-install-extras --proxy
+
+  # Refresh the login banner after editing hostnames in cluster.env:
+  spark-install-extras --motd
+
+  # Verify symlinks were created:
+  ls -la /usr/local/bin/spark-*
+
+See also:
+  spark-init              create cluster.env and model.env (prerequisite)
+  spark-install-services  install systemd service units
+  spark-help              full command reference
+  install.sh              unified one-shot installer (runs --symlinks automatically)
+EOF
     exit 0
 fi
 

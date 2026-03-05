@@ -5,10 +5,76 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-reset"
-    echo ""
-    echo "Full cluster restart: stop all services, clean up, restart."
-    echo "Uses current mode and engine from config."
+    cat <<'EOF'
+spark-reset — Stop all inference services then restart them with the current config
+
+Performs a complete stop/wait/start cycle: calls spark-stop (ignoring errors
+so a stuck or partially-dead service cannot block the restart), waits 5 seconds
+for GPU memory and OS resources to fully release, then execs spark-serve.
+
+Use spark-reset when: the model is not responding to requests, you have
+updated model.env and want to reload the new configuration, or spark-check
+shows failures but services appear partially alive. It is the fastest
+recovery path that does not require manual intervention.
+
+Note: spark-stop is called with default options — inference processes are
+killed but the Docker stack and Swarm membership are preserved. To also
+tear down the stack, run 'spark-stop --stack' then 'spark-serve' manually.
+
+Usage:
+  spark-reset
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists  (run spark-init to create it)
+  - Model is configured in ~/.config/spark-tools/model.env — the same
+    requirement as spark-serve, since spark-reset calls spark-serve at the end
+  - No arguments are accepted; options cannot be passed through to spark-stop
+    or spark-serve
+
+Behavior:
+  1. Loads config (cluster.env → model.env → node.env overrides); exits 1 on
+     missing cluster.env
+  2. Prints:  === Spark Cluster Reset (<MODE> + <ENGINE>) ===
+  3. Runs spark-stop with default options (kills inference processes; Docker
+     stack and Swarm membership are preserved). Stop failures are suppressed
+     with '|| true' — a broken service state will not abort the reset.
+  4. Prints:  Waiting 5 seconds...
+  5. Sleeps 5 seconds to allow GPU memory and file handles to release
+  6. Prints:  --- Starting services ---
+  7. Execs spark-serve — spark-reset does not return; the process is replaced
+     by spark-serve, which hands off to the mode backend
+
+  On success: spark-serve takes over the process and inference comes back up.
+              Use spark-check in another shell to confirm the endpoint is live.
+  On stop failure: the error is printed to stderr but execution continues;
+              the 5-second wait and spark-serve still run.
+  On serve failure: spark-serve exits non-zero; inspect its output for cause.
+
+Expected output:
+  === Spark Cluster Reset (swarm + trtllm) ===
+
+  --- Stopping services ---
+  ==> Stopping spark services...
+  [backend stop output]
+
+  Waiting 5 seconds...
+
+  --- Starting services ---
+  [backend serve output — spark-reset does not return after this line]
+
+Exit codes:
+  0   spark-serve exec'd successfully (model may still be loading;
+      use spark-check to confirm the endpoint is live)
+  1   Configuration error before reset could start (missing cluster.env,
+      invalid mode/engine combination), or spark-serve itself failed
+
+See also:
+  spark-stop       Stop without restarting
+  spark-serve      Start without stopping first
+  spark-check      Verify the cluster is healthy after reset completes
+  spark-status     Detailed backend service and container status
+  spark-help       Comprehensive quick reference for all spark-tools commands
+EOF
     exit 0
 fi
 

@@ -1,27 +1,215 @@
 #!/usr/bin/env bash
+# spark-set-model - Change the active model configuration
+#
+# Updates model.env with the new model (and optional overrides).
+#
+# Split mode:  syncs config to secondary node (dyad) and restarts
+#              vllm-standalone on both nodes.  Includes a pre-flight
+#              check that the model cache exists on the secondary
+#              before committing to a restart.
+#
+# Ray/Swarm:   updates config only — run 'spark-stop && spark-serve'
+#              to apply.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-set-model <model-name> [--tp SIZE] [--ctx LENGTH] [--mem UTIL]"
-    echo ""
-    echo "Change the active model in model.env."
-    echo "Does NOT restart services — run spark-stop && spark-serve after."
-    echo ""
-    echo "Arguments:"
-    echo "  model-name     HuggingFace model ID (e.g., nvidia/Qwen3-14B-FP4)"
-    echo ""
-    echo "Options:"
-    echo "  --tp SIZE      Tensor parallel size (default: keep current)"
-    echo "  --ctx LENGTH   Max context length (default: keep current)"
-    echo "  --mem UTIL     GPU memory utilization 0.0-1.0 (default: keep current)"
-    echo "  --served NAME  Served model name / alias (default: none)"
-    echo ""
-    echo "Examples:"
-    echo "  spark-set-model nvidia/Qwen3-235B-A22B-FP4"
-    echo "  spark-set-model Qwen/Qwen3-Coder-Next-FP8 --tp 2 --ctx 131072"
+    cat << 'EOF'
+spark-set-model — change the active model configuration
+
+Updates model.env with the new model name and optional parameter overrides.
+Behavior differs significantly based on the current topology mode.
+
+WHAT IT DOES
+============
+All modes:
+  Writes MODEL_NAME (and any --tp/--ctx/--mem/--served overrides) to
+  ~/.config/spark-tools/model.env using sed in-place substitution.
+  Only values explicitly passed are changed; others are left as-is.
+
+Split mode (monad + dyad each running an independent vLLM instance):
+  ADDITIONALLY performs a 4-step live update sequence:
+    [1/4] Pre-flight: SSH to dyad; check model's HuggingFace cache directory
+          exists at: $HF_HOME/hub/models--<Org>--<Model>/
+          If not found: warns, shows download command, prompts y/N to continue.
+          If N: aborts (model.env is updated locally but NOT synced — nodes are
+          out of sync until you run spark-set-model again).
+    [2/4] Sync: scp model.env → dyad:~/.config/spark-tools/model.env
+    [3/4] Restart: sudo systemctl restart vllm-standalone  (on monad)
+    [4/4] Restart: ssh dyad sudo systemctl restart vllm-standalone
+          Waits 5s then prints the first 12 lines of systemctl status from both
+          nodes so you can see whether the service came up cleanly.
+
+Ray / Swarm mode:
+  Config-only update. Services are NOT restarted automatically.
+  Run 'spark-stop && spark-serve' to apply.
+
+WHY THE DIFFERENCE
+==================
+In split mode, both nodes serve independently and restart is safe immediately —
+each node's vllm-standalone is self-contained. Keeping both nodes in sync is
+critical: an unsync'd dyad will serve the old model while monad serves the new.
+
+In ray/cluster mode, the model is sharded across both nodes simultaneously.
+Restarting requires a coordinated sequence: stop spark-ray-vllm, stop
+spark-ray-worker, stop spark-ray-head, then restart in reverse order.
+That sequence is handled by 'spark-stop && spark-serve', not here.
+
+PRECONDITIONS
+=============
+  - spark-init must have been run; model.env must exist
+    (error if missing: "Run 'spark-init' to create it.")
+  - The model must already be downloaded on monad
+  - For split mode additionally:
+      - Passwordless SSH from monad to dyad as current $USER
+      - Model weights downloaded on dyad at:
+          $HF_HOME/hub/models--<Org>--<Model>/
+          where "Org/Model" → "models--Org--Model" (slashes become --)
+      - sudo access on both nodes (to restart systemd services)
+
+USAGE
+=====
+  spark-set-model <model-name> [OPTIONS]
+
+ARGUMENTS
+=========
+  model-name    HuggingFace repository ID. Required.
+                Format: Org/ModelName
+                Example: nvidia/Qwen3-235B-A22B-FP4
+
+OPTIONS
+=======
+  --tp SIZE           Tensor parallel size. Number of GPUs used for this model.
+                      Split mode: use 1 (each node serves independently, TP=1).
+                      Cluster mode: use 2 (TP=2 sharded across monad + dyad).
+                      WARNING: if current model.env has TP_SIZE=2 and the current
+                      topology is split, you will see a warning but are not blocked.
+                      Use --tp 1 explicitly when switching to split.
+                      Default: keep current value in model.env.
+
+  --ctx LENGTH        Max context length in tokens.
+                      Per-node overrides in node.env.monad / node.env.dyad can
+                      set different context windows per node (e.g. monad=131072,
+                      dyad=262144 when dyad has more GPU headroom).
+                      Default: keep current value in model.env.
+
+  --mem UTIL          GPU memory utilization fraction, 0.0–1.0.
+                      Per-node overrides in node.env.monad / node.env.dyad can
+                      set different utilization per node.
+                      Default: keep current value in model.env.
+
+  --served NAME       Model alias returned by the /v1/models API endpoint.
+                      Clients use this short name instead of the full HF path.
+                      Example: --served qwen3 so clients call model="qwen3".
+                      Default: keep current value (empty = use full MODEL_NAME).
+
+  --skip-preflight    Skip the model cache directory check on dyad.
+                      Use when you know the cache exists but the directory probe
+                      might fail (custom HF_HOME, symlinked cache, NFS mount).
+                      Split mode only — has no effect in ray/swarm mode.
+
+SIDE EFFECTS
+============
+  - Modifies ~/.config/spark-tools/model.env in-place (sed substitution)
+  - Split mode: also writes to dyad:~/.config/spark-tools/model.env via scp
+  - Split mode: immediately restarts vllm-standalone on both nodes
+  - Split mode abort (user enters N at prompt): model.env updated locally but
+    NOT synced to dyad. Nodes are out of sync.
+    Recover with: spark-set-model <previous-model>
+
+EXAMPLES
+========
+Switch model (split mode — shows the full 4-step sequence):
+  $ spark-set-model nvidia/Qwen3-235B-A22B-FP4
+  Model updated in /home/user/.config/spark-tools/model.env:
+    MODEL_NAME=nvidia/Qwen3-235B-A22B-FP4
+
+  === Split mode: syncing and restarting both nodes ===
+
+  ==> [1/4] Pre-flight: checking model cache on dyad...
+    ✓ Cache found on dyad:
+      /home/user/.cache/huggingface/hub/models--nvidia--Qwen3-235B-A22B-FP4
+      42 .safetensors file(s) in snapshot
+
+  ==> [2/4] Syncing model.env → dyad...
+    ✓ Synced: /home/user/.config/spark-tools/model.env → dyad:...model.env
+
+  ==> [3/4] Restarting vllm-standalone on monad...
+    ✓ vllm-standalone restarted on monad
+
+  ==> [4/4] Restarting vllm-standalone on dyad...
+    ✓ vllm-standalone restarted on dyad
+
+  Waiting for vLLM instances to start (large models take several minutes)...
+
+  --- monad: vllm-standalone ---
+    ... systemctl status output (12 lines) ...
+
+  --- dyad: vllm-standalone ---
+    ... systemctl status output (12 lines) ...
+
+  Monitor logs:
+    journalctl -u vllm-standalone -f                      # monad
+    ssh dyad journalctl -u vllm-standalone -f             # dyad
+
+  Check health once ready:
+    spark-check
+
+Switch model with explicit TP and context (ray/swarm mode — config only):
+  $ spark-set-model Qwen/Qwen3-Coder-480B-A22B-FP4 --tp 2 --ctx 131072
+  Model updated in /home/user/.config/spark-tools/model.env:
+    MODEL_NAME=Qwen/Qwen3-Coder-480B-A22B-FP4
+    TP_SIZE=2
+    MAX_MODEL_LEN=131072
+
+  Restart to apply: spark-stop && spark-serve
+
+Set a short client-facing model name:
+  $ spark-set-model meta-llama/Llama-3.3-70B-Instruct --served llama3
+  Model updated in /home/user/.config/spark-tools/model.env:
+    MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct
+    SERVED_MODEL_NAME=llama3
+
+  Restart to apply: spark-stop && spark-serve
+
+Pre-flight failure — model not downloaded on dyad (split mode):
+  $ spark-set-model SomeOrg/NewModel
+  Model updated in /home/user/.config/spark-tools/model.env:
+    MODEL_NAME=SomeOrg/NewModel
+
+  === Split mode: syncing and restarting both nodes ===
+
+  ==> [1/4] Pre-flight: checking model cache on dyad...
+
+  WARNING: Model cache not found on dyad.
+  Expected: /home/user/.cache/huggingface/hub/models--SomeOrg--NewModel
+
+  The model must be downloaded on dyad before vllm-standalone can serve it.
+
+  To pre-download on dyad:
+    ssh dyad huggingface-cli download 'SomeOrg/NewModel'
+
+  Continue anyway? [y/N] N
+
+  Aborted. Config was updated locally but NOT synced.
+  Restore previous model with: spark-set-model <old-model>
+
+EXIT CODES
+==========
+  0   Success (config updated; in split mode, services restarted on both nodes)
+  1   model.env not found, SSH failure, bad argument, or user entered N at prompt
+
+SEE ALSO
+========
+  spark-help          Full list of spark commands with descriptions
+  spark-init          Initialize configuration (creates model.env)
+  spark-mode          View/change topology (split/cluster) and orchestration
+  spark-serve         Start inference services (ray/swarm mode after config change)
+  spark-stop          Stop inference services
+  spark-check         Verify the API endpoint is responding correctly
+EOF
     exit 0
 fi
 
@@ -32,31 +220,197 @@ spark_load_config
 NEW_MODEL="$1"
 shift
 
+# ---------------------------------------------------------------------------
 # Parse optional overrides
-NEW_TP="" NEW_CTX="" NEW_MEM="" NEW_SERVED="" SET_SERVED=false
+# ---------------------------------------------------------------------------
+NEW_TP=""
+NEW_CTX=""
+NEW_MEM=""
+NEW_SERVED=""
+SET_SERVED=false
+SKIP_PREFLIGHT=false
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tp)     shift; NEW_TP="${1:-}"; [[ -z "$NEW_TP" ]] && spark_die "--tp requires a value" ;;
-        --ctx)    shift; NEW_CTX="${1:-}"; [[ -z "$NEW_CTX" ]] && spark_die "--ctx requires a value" ;;
-        --mem)    shift; NEW_MEM="${1:-}"; [[ -z "$NEW_MEM" ]] && spark_die "--mem requires a value" ;;
-        --served) shift; NEW_SERVED="${1:-}"; SET_SERVED=true ;;
-        *) spark_die "Unknown option: $1" ;;
+        --tp)              shift; NEW_TP="${1:-}";     [[ -z "$NEW_TP" ]]  && spark_die "--tp requires a value" ;;
+        --ctx)             shift; NEW_CTX="${1:-}";    [[ -z "$NEW_CTX" ]] && spark_die "--ctx requires a value" ;;
+        --mem)             shift; NEW_MEM="${1:-}";    [[ -z "$NEW_MEM" ]] && spark_die "--mem requires a value" ;;
+        --served)          shift; NEW_SERVED="${1:-}"; SET_SERVED=true ;;
+        --skip-preflight)  SKIP_PREFLIGHT=true ;;
+        *) spark_die "Unknown option: $1. Use --help for usage." ;;
     esac
     shift
 done
 
-# Update model.env
+# ---------------------------------------------------------------------------
+# Apply split-mode TP default (1 per node, not 2)
+# ---------------------------------------------------------------------------
+if [[ "$SPARK_MODE" == "split" && -z "$NEW_TP" ]]; then
+    CURRENT_TP="${TP_SIZE:-}"
+    # Only suggest TP=1 if current config has TP=2 (likely a leftover from ray mode)
+    if [[ "${CURRENT_TP}" == "2" ]]; then
+        _yellow "WARNING: Current TP_SIZE=2 — split mode runs one vLLM per node."
+        _yellow "         TP=2 requires two GPUs on a single node. Did you mean --tp 1?"
+        echo ""
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Update model.env (local)
+# ---------------------------------------------------------------------------
+if [[ ! -f "$SPARK_MODEL_ENV" ]]; then
+    spark_die "model.env not found: ${SPARK_MODEL_ENV}
+Run 'spark-init' to create it."
+fi
+
 sed -i "s|^MODEL_NAME=.*|MODEL_NAME=${NEW_MODEL}|" "$SPARK_MODEL_ENV"
-[[ -n "$NEW_TP" ]]     && sed -i "s/^TP_SIZE=.*/TP_SIZE=${NEW_TP}/" "$SPARK_MODEL_ENV"
-[[ -n "$NEW_CTX" ]]    && sed -i "s/^MAX_MODEL_LEN=.*/MAX_MODEL_LEN=${NEW_CTX}/" "$SPARK_MODEL_ENV"
-[[ -n "$NEW_MEM" ]]    && sed -i "s/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=${NEW_MEM}/" "$SPARK_MODEL_ENV"
+[[ -n "$NEW_TP" ]]          && sed -i "s/^TP_SIZE=.*/TP_SIZE=${NEW_TP}/"                      "$SPARK_MODEL_ENV"
+[[ -n "$NEW_CTX" ]]         && sed -i "s/^MAX_MODEL_LEN=.*/MAX_MODEL_LEN=${NEW_CTX}/"        "$SPARK_MODEL_ENV"
+[[ -n "$NEW_MEM" ]]         && sed -i "s/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=${NEW_MEM}/"          "$SPARK_MODEL_ENV"
 [[ "$SET_SERVED" == true ]] && sed -i "s/^SERVED_MODEL_NAME=.*/SERVED_MODEL_NAME=${NEW_SERVED}/" "$SPARK_MODEL_ENV"
 
-echo "Model updated in $SPARK_MODEL_ENV:"
+echo "Model updated in ${SPARK_MODEL_ENV}:"
 echo "  MODEL_NAME=${NEW_MODEL}"
-[[ -n "$NEW_TP" ]]     && echo "  TP_SIZE=${NEW_TP}"
-[[ -n "$NEW_CTX" ]]    && echo "  MAX_MODEL_LEN=${NEW_CTX}"
-[[ -n "$NEW_MEM" ]]    && echo "  GPU_MEM_UTIL=${NEW_MEM}"
+[[ -n "$NEW_TP" ]]          && echo "  TP_SIZE=${NEW_TP}"
+[[ -n "$NEW_CTX" ]]         && echo "  MAX_MODEL_LEN=${NEW_CTX}"
+[[ -n "$NEW_MEM" ]]         && echo "  GPU_MEM_UTIL=${NEW_MEM}"
 [[ "$SET_SERVED" == true ]] && echo "  SERVED_MODEL_NAME=${NEW_SERVED}"
 echo ""
-echo "Restart to apply: spark-stop && spark-serve"
+
+# ===========================================================================
+# SPLIT MODE: sync → dyad, restart both nodes
+# ===========================================================================
+if [[ "$SPARK_MODE" == "split" ]]; then
+
+    PRIMARY="${SPARK_PRIMARY_HOST}"
+    SECONDARY="${SPARK_SECONDARY_HOST}"
+
+    echo "=== Split mode: syncing and restarting both nodes ==="
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 1/4 — Pre-flight: check model cache on secondary
+    # -----------------------------------------------------------------------
+    echo "==> [1/4] Pre-flight: checking model cache on ${SECONDARY}..."
+
+    # Convert HuggingFace repo ID to HF hub cache directory name.
+    # e.g.  "Qwen/Qwen3-Coder-Next-FP8" → "models--Qwen--Qwen3-Coder-Next-FP8"
+    MODEL_CACHE_DIR="models--$(echo "$NEW_MODEL" | tr '/' '--')"
+    REMOTE_HF_HUB="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+
+    CACHE_FOUND=false
+    if [[ "$SKIP_PREFLIGHT" == true ]]; then
+        echo "  (pre-flight skipped via --skip-preflight)"
+        CACHE_FOUND=true
+    elif spark_ssh "$SECONDARY" \
+            "test -d '${REMOTE_HF_HUB}/${MODEL_CACHE_DIR}'" 2>/dev/null; then
+        echo "  ✓ Cache found on ${SECONDARY}:"
+        echo "    ${REMOTE_HF_HUB}/${MODEL_CACHE_DIR}"
+
+        # Count snapshot files as a basic completeness signal
+        SNAP_COUNT=$(spark_ssh "$SECONDARY" \
+            "find '${REMOTE_HF_HUB}/${MODEL_CACHE_DIR}/snapshots' \
+             -maxdepth 2 -name '*.safetensors' 2>/dev/null | wc -l" 2>/dev/null \
+            || echo "?")
+        echo "    ${SNAP_COUNT} .safetensors file(s) in snapshot"
+        CACHE_FOUND=true
+    else
+        echo ""
+        _yellow "  WARNING: Model cache not found on ${SECONDARY}."
+        _yellow "  Expected: ${REMOTE_HF_HUB}/${MODEL_CACHE_DIR}"
+        _yellow ""
+        _yellow "  The model must be downloaded on ${SECONDARY} before vllm-standalone"
+        _yellow "  can serve it. Without the cache, the service will fail to start."
+        echo ""
+        echo "  To pre-download on ${SECONDARY}:"
+        echo "    ssh ${SECONDARY} huggingface-cli download '${NEW_MODEL}'"
+        echo ""
+        read -r -p "  Continue anyway? [y/N] " REPLY
+        echo ""
+        if [[ ! "${REPLY,,}" =~ ^y ]]; then
+            echo "Aborted. Config was updated locally but NOT synced."
+            echo "Restore previous model with: spark-set-model <old-model>"
+            exit 1
+        fi
+    fi
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 2/4 — Sync model.env → secondary
+    # -----------------------------------------------------------------------
+    echo "==> [2/4] Syncing model.env → ${SECONDARY}..."
+
+    # Ensure remote config directory exists
+    REMOTE_CONFIG_DIR="${SPARK_CONFIG_DIR}"
+    spark_ssh "$SECONDARY" "mkdir -p '${REMOTE_CONFIG_DIR}'" 2>/dev/null
+
+    scp -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        "$SPARK_MODEL_ENV" \
+        "${SECONDARY}:${SPARK_MODEL_ENV}"
+
+    echo "  ✓ Synced: ${SPARK_MODEL_ENV} → ${SECONDARY}:${SPARK_MODEL_ENV}"
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 3/4 — Restart vllm-standalone on primary (this node)
+    # -----------------------------------------------------------------------
+    echo "==> [3/4] Restarting vllm-standalone on ${PRIMARY}..."
+
+    if sudo systemctl restart vllm-standalone 2>/dev/null; then
+        echo "  ✓ vllm-standalone restarted on ${PRIMARY}"
+    else
+        _yellow "  WARNING: Could not restart vllm-standalone on ${PRIMARY}"
+        _yellow "           sudo may be required.  Restart manually:"
+        _yellow "           sudo systemctl restart vllm-standalone"
+    fi
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 4/4 — Restart vllm-standalone on secondary
+    # -----------------------------------------------------------------------
+    echo "==> [4/4] Restarting vllm-standalone on ${SECONDARY}..."
+
+    if spark_ssh "$SECONDARY" "sudo systemctl restart vllm-standalone" 2>/dev/null; then
+        echo "  ✓ vllm-standalone restarted on ${SECONDARY}"
+    else
+        _yellow "  WARNING: Could not restart vllm-standalone on ${SECONDARY}"
+        _yellow "           Restart manually:"
+        _yellow "           ssh ${SECONDARY} sudo systemctl restart vllm-standalone"
+    fi
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Wait and show brief status
+    # -----------------------------------------------------------------------
+    echo "Waiting for vLLM instances to start (large models take several minutes)..."
+    sleep 5
+    echo ""
+
+    echo "--- ${PRIMARY}: vllm-standalone ---"
+    sudo systemctl --no-pager status vllm-standalone 2>/dev/null \
+        | head -12 \
+        | sed 's/^/  /' \
+        || true
+    echo ""
+
+    echo "--- ${SECONDARY}: vllm-standalone ---"
+    spark_ssh "$SECONDARY" \
+        "sudo systemctl --no-pager status vllm-standalone 2>/dev/null | head -12" \
+        2>/dev/null \
+        | sed 's/^/  /' \
+        || true
+    echo ""
+
+    echo "Monitor logs:"
+    echo "  journalctl -u vllm-standalone -f                      # ${PRIMARY}"
+    echo "  ssh ${SECONDARY} journalctl -u vllm-standalone -f     # ${SECONDARY}"
+    echo ""
+    echo "Check health once ready:"
+    echo "  spark-check"
+
+# ===========================================================================
+# RAY / SWARM MODE: config-only update
+# ===========================================================================
+else
+    echo "Restart to apply: spark-stop && spark-serve"
+fi

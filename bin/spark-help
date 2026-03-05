@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# spark-help - Comprehensive reference for the spark-tools cluster management system
+#
+# When run with no arguments: prints the full cluster reference including
+# live current state, all spark-* commands, operational workflows, config
+# hierarchy, operating modes, and a troubleshooting quick reference.
+#
+# Intended as the primary reference for AI agents and human operators.
+# Individual spark-* commands also support --help for per-command details.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+# ---------------------------------------------------------------------------
+# --help: brief meta-description (for agents inspecting this tool itself)
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat <<'EOF'
+spark-help prints a comprehensive reference for the spark-tools cluster
+management system. Run it with no arguments to see the full reference.
+
+The reference includes:
+  - Current cluster state (live values from config)
+  - Full command reference for all spark-* tools with key flags
+  - Operational workflows: start serving, switch models, change topology
+  - Configuration file hierarchy and key variables
+  - Operating modes explained (split, ray, swarm) with tradeoffs
+  - Troubleshooting quick reference: symptoms and fix commands
+
+Individual spark-* commands also support --help for per-command details.
+EOF
+    exit 0
+fi
+
+spark_load_config
+
+PORT="$(spark_effective_port)"
+PROXY_PORT="${SPARK_PROXY_PORT:-9000}"
+TOPOLOGY="$(cat "${SPARK_CONFIG_DIR}/topology" 2>/dev/null || echo "cluster")"
+SEP="============================================================"
+
+# ===========================================================================
+# SECTION 1: Current cluster state  (colored — quick glance for humans)
+# ===========================================================================
+echo ""
+_bold "$SEP"
+_bold " Spark Tools  —  Cluster Reference"
+echo ""
+printf "  Mode:      %s\n"    "${SPARK_MODE}"
+printf "  Topology:  %s\n"    "${TOPOLOGY}"
+printf "  Engine:    %s\n"    "${SPARK_ENGINE}"
+printf "  Primary:   %s\n"    "${SPARK_PRIMARY_HOST}"
+printf "  Secondary: %s\n"    "${SPARK_SECONDARY_HOST}"
+printf "  QSFP:      %s\n"    "${SPARK_QSFP_IFACE}"
+if [[ -n "${MODEL_NAME:-}" ]]; then
+    printf "  Model:     %s\n"    "${MODEL_NAME}"
+    printf "             TP=%-3s  ctx=%s  mem=%s\n" \
+        "${TP_SIZE:-?}" "${MAX_MODEL_LEN:-?}" "${GPU_MEM_UTIL:-?}"
+fi
+printf "  API:       http://localhost:%s/v1\n" "${PORT}"
+[[ "$SPARK_MODE" == "split" ]] && \
+    printf "  Proxy LB:  http://localhost:%s/v1\n" "${PROXY_PORT}"
+_bold "$SEP"
+
+# ===========================================================================
+# SECTION 2: Mode-specific service and health commands
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# SPLIT MODE
+# ---------------------------------------------------------------------------
+if [[ "$SPARK_MODE" == "split" ]]; then
+
+    echo ""
+    _bold "--- Split Mode: ${SPARK_PRIMARY_HOST} (head) ---"
+    echo "  systemctl status vllm-standalone    # vLLM instance (this node)"
+    echo "  systemctl status vllm-proxy         # load balancer / router"
+    echo "  systemctl status open-webui"
+    echo ""
+    _bold "--- Split Mode: ${SPARK_SECONDARY_HOST} (worker) ---"
+    echo "  ssh ${SPARK_SECONDARY_HOST} systemctl status vllm-standalone"
+    echo ""
+    _bold "--- Switching models (split mode) ---"
+    echo "  spark-set-model <repo>              # updates config, syncs to"
+    echo "                                      # ${SPARK_SECONDARY_HOST}, restarts both"
+    echo "  spark-set-model <repo> --tp 1 --ctx 131072"
+    echo ""
+    _bold "--- Logs ---"
+    echo "  journalctl -u vllm-standalone -f              # ${SPARK_PRIMARY_HOST}"
+    echo "  journalctl -u vllm-proxy -f"
+    echo "  ssh ${SPARK_SECONDARY_HOST} journalctl -u vllm-standalone -f"
+    echo ""
+    _bold "--- Health checks ---"
+    echo "  spark-check"
+    echo "  curl http://localhost:${SPARK_PORT:-8000}/health          # ${SPARK_PRIMARY_HOST} direct"
+    echo "  curl http://${SPARK_SECONDARY_HOST}:${SPARK_PORT:-8000}/health     # ${SPARK_SECONDARY_HOST} direct"
+    echo "  curl http://localhost:${PROXY_PORT}/health           # proxy LB"
+    echo "  curl http://localhost:${PROXY_PORT}/v1/models        # models via proxy"
+    echo ""
+    _bold "--- Mode switching ---"
+    echo "  sudo spark-mode cluster             # Ray TP=2 cluster"
+    echo "  spark-mode swarm                    # Docker Swarm + MPI"
+
+# ---------------------------------------------------------------------------
+# RAY MODE
+# ---------------------------------------------------------------------------
+elif [[ "$SPARK_MODE" == "ray" ]]; then
+
+    echo ""
+    _bold "--- Ray Mode: ${SPARK_PRIMARY_HOST} (head) ---"
+    echo "  systemctl status vllm-ray-head"
+    echo "  systemctl status vllm"
+    echo "  systemctl status vllm-proxy"
+    echo "  systemctl status open-webui"
+    echo ""
+    _bold "--- Ray Mode: ${SPARK_SECONDARY_HOST} (worker) ---"
+    echo "  ssh ${SPARK_SECONDARY_HOST} systemctl status vllm-ray-worker"
+    echo ""
+    _bold "--- Ray cluster ---"
+    echo "  docker exec spark-ray ray status    # Ray cluster overview"
+    echo "  docker exec spark-ray ray list node # node details"
+    echo ""
+    _bold "--- Logs ---"
+    echo "  journalctl -u vllm -f"
+    echo "  journalctl -u vllm-ray-head -f"
+    echo "  journalctl -u vllm-proxy -f"
+    echo "  ssh ${SPARK_SECONDARY_HOST} journalctl -u vllm-ray-worker -f"
+    echo ""
+    _bold "--- Health checks ---"
+    echo "  spark-check"
+    echo "  curl http://localhost:${PORT}/health"
+    echo "  curl http://localhost:${PORT}/v1/models"
+    echo ""
+    _bold "--- Mode switching ---"
+    echo "  sudo spark-mode split               # two independent vLLM instances"
+    echo "  spark-mode swarm                    # Docker Swarm + MPI"
+
+# ---------------------------------------------------------------------------
+# SWARM MODE
+# ---------------------------------------------------------------------------
+elif [[ "$SPARK_MODE" == "swarm" ]]; then
+
+    echo ""
+    _bold "--- Swarm Mode: ${SPARK_PRIMARY_HOST} (head) ---"
+    echo "  docker stack ls                     # deployed stacks"
+    echo "  docker stack services spark         # service replica status"
+    echo "  docker stack ps spark               # per-task placement"
+    echo "  systemctl status vllm-proxy"
+    echo "  systemctl status open-webui"
+    echo ""
+    _bold "--- Swarm nodes ---"
+    echo "  docker node ls                      # all Swarm nodes"
+    echo "  ssh ${SPARK_SECONDARY_HOST} docker info       # remote node state"
+    echo ""
+    _bold "--- Logs ---"
+    echo "  docker service logs spark_vllm -f"
+    echo "  journalctl -u vllm-proxy -f"
+    echo "  journalctl -u open-webui -f"
+    echo ""
+    _bold "--- Health checks ---"
+    echo "  spark-check"
+    echo "  curl http://localhost:${PORT}/health"
+    echo "  curl http://localhost:${PORT}/v1/models"
+    echo ""
+    _bold "--- Mode switching ---"
+    echo "  sudo spark-mode split               # two independent vLLM instances"
+    echo "  spark-mode ray                      # Ray TP=2 cluster"
+
+# ---------------------------------------------------------------------------
+# UNKNOWN MODE
+# ---------------------------------------------------------------------------
+else
+    echo ""
+    _yellow "  Unknown SPARK_MODE: '${SPARK_MODE}'"
+    _yellow "  Expected: split | ray | swarm"
+    echo ""
+    echo "  Edit: ${SPARK_CLUSTER_ENV}"
+fi
+
+# ===========================================================================
+# SECTION 3: Always-on: config files + model operations + benchmark
+# ===========================================================================
+echo ""
+_bold "--- Config files ---"
+printf "  %-44s  cluster settings\n" "${SPARK_CLUSTER_ENV}"
+printf "  %-44s  model settings\n"   "${SPARK_MODEL_ENV}"
+echo ""
+_bold "--- Model operations ---"
+echo "  spark-set-model <repo>              # change model"
+echo "  spark-set-model <repo> --tp 1       # with TP override"
+echo "  spark-set-model <repo> --ctx 131072 # with context length"
+echo "  spark-set-model --help              # full usage"
+echo "  cat ${SPARK_MODEL_ENV}"
+echo ""
+_bold "--- Benchmark ---"
+echo "  spark-bench                         # default: 3 runs, 256 tokens"
+echo "  spark-bench 5 512                   # 5 runs, 512 tokens"
+echo ""
+_bold "$SEP"
+
+# ===========================================================================
+# SECTIONS 4-8: Plain text reference (no ANSI — clean for agent parsing)
+# ===========================================================================
+
+cat <<'CMDREF'
+
+================================================================
+COMMAND REFERENCE
+================================================================
+Each command supports --help for full usage. Below: one-line summary,
+key flags, and which modes each command applies to.
+
+spark-init [--force]
+  Initialize config files (cluster.env + model.env) in ~/.config/spark-tools/
+  Auto-detects hostname, QSFP interface, and secondary node.
+  --force overwrites existing config. Run once on the head node (monad).
+  Applies to: initial setup.
+  Run: spark-init --help
+
+spark-mode [COMMAND] [--engine ENGINE]
+  Show or switch cluster orchestration mode and deployment topology.
+  No args: print current mode, engine, topology, and config.
+  Orchestration commands (update cluster.env only; no services restarted):
+    swarm [--engine trtllm|vllm]  Switch to Docker Swarm + MPI orchestration
+    ray                           Switch to Ray cluster orchestration (vllm only)
+  Topology commands (install units + start/stop services; require sudo):
+    split    Two independent vLLM instances, one per node (TP=1) -- best perf
+    cluster  Ray TP=2 cluster across both nodes
+    status   Show current topology and service states on both nodes
+  --engine ENGINE  Also switch inference engine (trtllm or vllm)
+  Applies to: all modes.
+  Run: spark-mode --help
+
+spark-set-model <model> [--tp N] [--ctx N] [--mem N] [--served NAME] [--skip-preflight]
+  Change the active model in model.env.
+  Split mode: verifies dyad model cache, syncs model.env, restarts both nodes.
+  Ray/swarm: config-only update -- apply with: spark-stop && spark-serve
+  --tp N            Tensor-parallel degree (split mode default: 1)
+  --ctx N           Max context length in tokens
+  --mem N           GPU memory utilization fraction (0.0-1.0)
+  --served NAME     API alias returned by /v1/models (optional)
+  --skip-preflight  Skip model cache check on secondary node
+  Applies to: all modes.
+  Run: spark-set-model --help
+
+spark-serve [model]
+  Start inference services using the current mode and engine from config.
+  Optional positional arg overrides MODEL_NAME for this invocation only.
+  Dispatches to backends/{SPARK_MODE}/serve.sh.
+  Applies to: all modes.
+  Run: spark-serve --help
+
+spark-stop [--kill-only|--stack|--swarm]
+  Stop the currently running inference services.
+  swarm+trtllm: --stack also removes the Docker stack; --swarm also leaves Swarm.
+  ray mode: stops Ray head/worker services and vLLM.
+  Applies to: all modes.
+  Run: spark-stop --help
+
+spark-reset
+  Full cluster restart: spark-stop, wait 5 seconds, spark-serve.
+  Useful when services are stuck or need a clean cycle.
+  Applies to: all modes.
+
+spark-status
+  Quick mode-specific status summary (dispatches to backend status script).
+  For a detailed health check with exit codes, use spark-check instead.
+  Applies to: all modes.
+
+spark-check
+  Detailed health check: services, HTTP endpoints, GPU stats, active model.
+  Color coded: green=OK, yellow=WARN, red=FAIL.
+  Exit code: 0 if all checks pass, 1 if any FAIL detected.
+  Applies to: all modes.
+  Run: spark-check --help
+
+spark-bench [runs] [max_tokens]
+  Benchmark the running inference endpoint via the OpenAI-compatible API.
+  Works with all engines. Defaults: 3 runs, 256 max tokens.
+  Run: spark-bench --help
+
+spark-install-services [--mode swarm|ray] [--dry-run] [--uninstall]
+  Install systemd service unit files from templates in systemd/.
+  Requires sudo. Detects whether it is running on the head or worker node.
+  --dry-run previews generated unit files without writing them.
+  Applies to: initial setup and after config changes.
+  Run: spark-install-services --help
+
+spark-install-extras [--motd] [--proxy] [--symlinks] [--all]
+  Install optional components:
+  --motd       Login banner showing cluster info (/etc/motd, requires sudo)
+  --proxy      Initialize auth proxy secret (~/.config/vllm-proxy/secret.env)
+  --symlinks   Create /usr/local/bin/spark-* symlinks for PATH access
+  Run: spark-install-extras --help
+
+spark-help
+  This reference. No args = full reference. --help = brief meta-description.
+CMDREF
+
+cat <<'WORKFLOWS'
+
+================================================================
+OPERATIONAL WORKFLOWS
+================================================================
+
+--- Initial setup (first time on a new cluster) ---
+  1. cd ~/spark-tools && ./install.sh      # bootstrap: IPs, SSH, Docker, systemd
+  2. spark-init                            # create ~/.config/spark-tools/{cluster,model}.env
+  3. spark-install-services               # install systemd units (run on each node)
+  4. spark-install-extras --symlinks      # add spark-* to /usr/local/bin (optional)
+  5. spark-set-model nvidia/Qwen3-235B-A22B-FP4  # configure the active model
+  6. sudo spark-mode split                # recommended first topology
+
+--- To start serving ---
+  spark-serve                             # start with current mode/engine from config
+  sudo spark-mode split                   # switch topology + auto-start (best performance)
+  sudo spark-mode cluster                 # switch topology + auto-start (Ray TP=2)
+
+--- To switch models ---
+  spark-set-model <repo>                  # split: syncs to dyad + restarts both automatically
+  spark-set-model <repo> --tp 1 --ctx 131072   # with explicit parallelism + context
+  # After model change in ray/swarm mode (config-only), apply it:
+  spark-stop && spark-serve
+
+--- To change topology ---
+  sudo spark-mode split                   # independent TP=1 per node -- best latency
+  sudo spark-mode cluster                 # Ray TP=2 -- use for models > single-GPU VRAM
+  spark-mode swarm --engine trtllm        # update orchestration config (for TRT-LLM)
+  spark-mode status                       # show current topology and service states
+
+--- To check health ---
+  spark-check                             # full health check with exit code
+  spark-status                            # quick mode-specific status from backend
+  spark-mode status                       # topology + per-service state on both nodes
+
+--- To benchmark ---
+  spark-bench                             # 3 runs, 256 max tokens
+  spark-bench 5 512                       # 5 runs, 512 tokens
+
+--- To view logs ---
+  journalctl -u spark-vllm-standalone -f            # split mode, monad
+  ssh dyad journalctl -u spark-vllm-standalone -f   # split mode, dyad
+  journalctl -u spark-ray-vllm -f                   # cluster (ray) mode
+  docker service logs spark_vllm -f                 # swarm mode
+  journalctl -u spark-proxy -f                      # auth proxy (all modes)
+WORKFLOWS
+
+# Config hierarchy — uses variable interpolation for the actual config path
+cat <<CONFHIER
+
+================================================================
+CONFIGURATION HIERARCHY
+================================================================
+Config directory: ${SPARK_CONFIG_DIR}
+  (override with \$SPARK_CONFIG_DIR environment variable)
+
+Load order — later files override earlier values for the same variable:
+  1. cluster.env          Orchestration: mode, engine, hosts, ports, Docker images
+  2. model.env            Model: name, TP size, context length, GPU memory, extra args
+  3. node.env             Generic per-node override (optional; applied on any node)
+  4. node.env.<hostname>  Host-specific override  e.g. node.env.monad, node.env.dyad
+
+  System-level overrides also load from /etc/spark-tools/node.env (lowest priority).
+
+Key variables in cluster.env:
+  SPARK_MODE            swarm | ray  (orchestration backend; topology stored separately)
+  SPARK_ENGINE          trtllm | vllm
+  SPARK_PRIMARY_HOST    head node hostname  (default: monad)
+  SPARK_SECONDARY_HOST  worker node hostname  (default: dyad)
+  SPARK_QSFP_IFACE      inter-node GPU traffic interface  (default: enp1s0f0np0)
+  SPARK_PORT            vLLM API port  (default: 8000)
+  SPARK_PROXY_PORT      auth proxy port  (default: 9000)
+  SPARK_PROXY_ENABLED   enable proxy service automatically  (default: false)
+
+Key variables in model.env:
+  MODEL_NAME            HuggingFace model repo  (e.g. nvidia/Qwen3-235B-A22B-FP4)
+  SERVED_MODEL_NAME     API alias returned by /v1/models  (optional)
+  TP_SIZE               Tensor-parallel degree  (1 = single GPU, 2 = both nodes)
+  MAX_MODEL_LEN         Max context window in tokens
+  GPU_MEM_UTIL          GPU memory fraction for KV cache  (0.0-1.0)
+  VLLM_EXTRA_ARGS       Additional vLLM CLI arguments
+  TRTLLM_PORT           TRT-LLM listen port  (default: 8355)
+  TRTLLM_MAX_BATCH_SIZE TRT-LLM max batch size
+
+node.env.monad / node.env.dyad — split mode per-node tuning:
+  Override GPU_MEM_UTIL, MAX_MODEL_LEN, VLLM_EXTRA_ARGS per node.
+  dyad can use higher GPU_MEM_UTIL since it hosts fewer services.
+  These files are synced to each node by 'sudo spark-mode split' and
+  'spark-set-model' (split mode).
+
+Topology state file (separate from SPARK_MODE):
+  ${SPARK_CONFIG_DIR}/topology
+  Written by 'sudo spark-mode split' and 'sudo spark-mode cluster'.
+  Values: split | cluster   Current value: ${TOPOLOGY}
+
+Config is created by: spark-init  (or ./install.sh on first run)
+CONFHIER
+
+cat <<'MODES'
+
+================================================================
+OPERATING MODES
+================================================================
+
+SPLIT  (topology: split)
+  Each node runs a completely independent vLLM instance at TP=1. No Ray,
+  no MPI, no inter-node GPU communication during inference. The auth proxy
+  on monad load-balances requests across both nodes.
+  Activate:   sudo spark-mode split
+  Requires:   Model cached on dyad; model must fit in a single GB10 GPU.
+  API:        http://monad:8000/v1  (direct) or http://monad:9000/v1  (proxy LB)
+  Services:   spark-vllm-standalone on each node, spark-proxy on monad
+  Strengths:
+    - CUDA graphs enabled at TP=1 (no --enforce-eager needed)
+    - Best latency and throughput: ~45 tok/s, ~0.3s first-token latency
+    - Per-node tuning via node.env.monad / node.env.dyad
+    - Each node can independently serve a different model
+    - FP8 KV cache, FlashInfer, prefix caching all work correctly
+  Weakness:   Model size limited to single-GPU VRAM (~119 GB on GB10)
+  Best for:   Models that fit one GB10 (e.g. Qwen3-235B-FP4), latency-sensitive
+              workloads, and agents that issue many short parallel requests.
+
+CLUSTER  (topology: cluster, orchestration: ray)
+  Ray cluster: vLLM runs with tensor-parallelism TP=2 across both nodes via
+  NCCL/UCX over the QSFP interconnect. Both GB10 GPUs appear as one device.
+  Activate:   sudo spark-mode cluster  (installs units + starts Ray + vLLM)
+              -- or: spark-mode ray  (config only), then spark-serve
+  Requires:   SPARK_ENGINE=vllm  (ray + trtllm is unsupported and will error)
+  API:        http://monad:8000/v1
+  Services:   spark-ray-head + spark-ray-vllm on monad, spark-ray-worker on dyad
+  Strengths:  Unified model weights across both GPUs; supports models that
+              exceed single-GPU VRAM; single API endpoint
+  Weakness:   --enforce-eager is required on GB10 at TP=2 to avoid a Triton
+              allocator crash during CUDA graph capture. This disables CUDA
+              graphs, reducing throughput (~16 tok/s, ~11s first-token latency).
+  Best for:   Models too large for a single GB10, or when a single unified
+              endpoint across both GPUs is required.
+
+SWARM  (orchestration: swarm)
+  Docker Swarm manages a multi-node stack. TRT-LLM uses MPI for inter-node
+  tensor parallelism. vLLM in swarm mode runs each node independently
+  (functionally similar to split, but lifecycle managed by Swarm).
+  Activate:   spark-mode swarm [--engine trtllm|vllm]  (then spark-serve)
+  Required:   SPARK_ENGINE=trtllm requires swarm mode (only supported combo)
+  API (trtllm): http://monad:8355/v1
+  API (vllm):   http://monad:8000/v1
+  Services:   spark-swarm-stack manages the Docker stack across both nodes
+  Strengths:  Highest batch throughput with TRT-LLM; production-grade
+              container lifecycle management
+  Weakness:   Docker Swarm cluster setup required; slower to iterate
+  Best for:   TRT-LLM engine, sustained batch workloads.
+
+Valid mode + engine combinations:
+  swarm + trtllm   Default; MPI tensor-parallel via Docker Swarm
+  swarm + vllm     vLLM via Swarm (nodes run independently)
+  ray   + vllm     Ray TP=2 distributed inference
+  ray   + trtllm   NOT SUPPORTED -- spark-serve will error at startup
+
+Hardware:
+  monad  DGX Spark  GB10 GPU  head node: API server, proxy, WebUI
+  dyad   DGX Spark  GB10 GPU  worker node: dedicated compute
+  QSFP   200 Gb/s direct link, link-local 169.254.x.x (no DHCP required)
+         Carries: NCCL all-reduce (Ray/vLLM) and MPI collectives (TRT-LLM)
+MODES
+
+cat <<'TROUBLESHOOT'
+
+================================================================
+TROUBLESHOOTING QUICK REFERENCE
+================================================================
+For complete troubleshooting: ~/spark-tools/docs/TROUBLESHOOTING.md
+
+SYMPTOM                              FIX
+-------                              ---
+Service won't start                  journalctl -u <service-name> -n 50
+
+GPU out of memory (OOM)              Lower GPU_MEM_UTIL in model.env or node.env.*
+                                     Restart: sudo systemctl restart spark-ray-vllm
+                                     (or spark-vllm-standalone in split mode)
+
+Triton allocator crash (TP=2)        Add --enforce-eager to VLLM_EXTRA_ARGS (temporary)
+                                     Better fix: sudo spark-mode split
+                                     (CUDA graphs work correctly at TP=1)
+
+High latency / low throughput        In split mode: verify --enforce-eager is NOT present
+                                     journalctl -u spark-vllm-standalone | grep -i eager
+                                     Check FlashInfer: grep -i flashinfer (same log)
+
+Ray worker not joining cluster       ssh dyad systemctl status spark-ray-worker
+                                     Verify: docker exec spark-ray ray status
+                                     Expect 2 nodes; check HEAD_IP in cluster.env on dyad
+
+503 All backends down (proxy)        spark-check
+                                     curl http://monad:8000/health
+                                     curl http://dyad:8000/health
+                                     systemctl cat spark-proxy | grep VLLM_BACKENDS
+
+401 Unauthorized (proxy)             cat ~/.config/vllm-proxy/secret.env
+                                     Client must send: Authorization: Bearer <token>
+                                     Rotate: ~/spark-tools/scripts/rotate-proxy-secret.sh
+
+404 Model not found (proxy)          curl -s http://localhost:9000/health | python3 -m json.tool
+                                     Check SERVED_MODEL_NAME alias in model.env
+                                     Use exact model ID shown by /v1/models
+
+SSH to dyad fails                    ssh-copy-id dyad
+                                     ssh-keyscan dyad >> ~/.ssh/known_hosts
+                                     getent hosts dyad  (verify /etc/hosts entry)
+
+QSFP interface down or missing       ip link show enp1s0f0np0
+                                     sudo ip link set enp1s0f0np0 up
+                                     ip addr show enp1s0f0np0 | grep 169.254
+                                     If interface name differs, update SPARK_QSFP_IFACE
+                                     in cluster.env and re-run install.sh
+
+Stale Docker container conflict      docker rm -f node
+  ("name already in use")            sudo systemctl restart spark-ray-head
+                                     (or spark-swarm-stack in swarm mode)
+
+Docker image not found               docker pull <image>  -- on BOTH nodes
+                                     docker images | grep -E 'vllm|trtllm'
+
+Swarm not initialized                docker swarm init --advertise-addr <MONAD_IP>  (monad)
+                                     docker swarm join --token <TOKEN> <IP>:2377   (dyad)
+                                     docker node ls  (verify both nodes visible)
+
+LAN IP changed after router swap     cd ~/spark-tools
+                                     ./install.sh --head-ip <NEW_IP> --worker-ip <NEW_IP>
+
+Missing tiktoken vocab files         sudo cp ~/spark-tools/encodings/*.tiktoken /etc/encodings/
+  (GPT-OSS model HarmonyError)       ssh dyad sudo mkdir -p /etc/encodings
+                                     ssh dyad sudo cp ...  (repeat on dyad)
+
+Service unit files out of sync       cd ~/spark-tools && ./install.sh --force
+  (after IP/username change)         sudo systemctl daemon-reload
+
+Full cluster reset                   spark-reset  (stop + 5s wait + serve)
+                                     Manual: spark-stop; sleep 5; spark-serve
+================================================================
+TROUBLESHOOT

@@ -1,0 +1,17 @@
+[Unit]
+Description=Open WebUI for spark-tools cluster
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{USERNAME}}
+
+ExecStart=/usr/bin/docker start -a open-webui
+ExecStop=/usr/bin/docker stop open-webui
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

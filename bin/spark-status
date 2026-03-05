@@ -5,10 +5,67 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-status"
-    echo ""
-    echo "Show cluster health and service status."
-    echo "Checks: cluster nodes, containers, GPU, API endpoint."
+    cat <<'EOF'
+spark-status — Show detailed inference service status for the current mode
+
+Delegates to the mode-specific backend status script, which reports the state
+of inference containers, processes, and orchestration layers. Output format
+and depth vary by mode and engine — this is the deep-dive, backend-native view
+of what is running.
+
+For a structured pass/fail health summary with GPU info, live endpoint
+verification, color-coded output, and a reliable exit code, use spark-check
+instead. spark-status is most useful when you need the backend's own view of
+service state: Docker service replica counts, Ray node topology, container
+placement, or engine-level health that spark-check does not expose.
+
+Usage:
+  spark-status
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists  (run spark-init to create it)
+  - The mode backend must be installed:
+      backends/swarm/status.sh   (for SPARK_MODE=swarm)
+      backends/ray/status.sh     (for SPARK_MODE=ray)
+  - ray + trtllm is not a valid combination and is rejected before dispatch
+
+Behavior:
+  1. Loads config (cluster.env → model.env → node.env overrides)
+  2. Validates SPARK_MODE and SPARK_ENGINE; exits 1 on invalid combination
+  3. Execs backends/${SPARK_MODE}/status.sh — spark-status does not return;
+     all subsequent output and exit code come from the backend
+
+  swarm mode (trtllm or vllm):
+    Reports Docker Swarm node state, stack 'spark' service replica counts,
+    container placement across monad and dyad, and engine health.
+
+  ray mode (vllm only):
+    Reports Ray cluster node status, vLLM service state, and worker
+    connectivity between monad (head) and dyad (worker).
+
+  For a consistent cross-mode summary that always includes GPU utilization,
+  active model config, and a live /v1/health probe, use spark-check — it runs
+  entirely inline (no backend dispatch) and always produces the same output
+  shape regardless of mode.
+
+Examples:
+  spark-status
+
+  # Check configured mode if output is unexpected
+  grep SPARK_MODE ~/.config/spark-tools/cluster.env
+
+Exit codes:
+  0   Backend status script completed successfully
+  1   Configuration error (missing cluster.env, invalid mode/engine
+      combination) or backend status script missing/not executable
+
+See also:
+  spark-check      Mode-aware health check with consistent output format,
+                   GPU info, live endpoint verification, and exit code 0/1
+  spark-serve      Start inference services
+  spark-stop       Stop inference services
+  spark-help       Comprehensive quick reference for all spark-tools commands
+EOF
     exit 0
 fi
 

@@ -6,13 +6,195 @@ SPARK_TOOLS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_DIR="${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-init [--force]"
-    echo ""
-    echo "Initialize spark-tools configuration."
-    echo "Creates config files in ${CONFIG_DIR}/"
-    echo ""
-    echo "Options:"
-    echo "  --force    Overwrite existing config files"
+    cat << EOF
+spark-init — initialize spark-tools configuration
+
+Creates the configuration directory and populates starter config files from
+the spark-tools example templates. This is the FIRST command to run on a
+fresh installation. Safe to re-run — existing files are skipped unless
+--force is given.
+
+WHAT IT CREATES
+===============
+  ${CONFIG_DIR}/cluster.env    Orchestration mode, host names, network, Docker images
+  ${CONFIG_DIR}/model.env      Model identity, TP size, memory, vLLM/TRT-LLM flags
+
+cluster.env is built by substituting auto-detected values into the example
+template. model.env is copied verbatim from the example template.
+
+PRECONDITIONS
+=============
+  - Run on the primary node (monad), as the operator user (NOT root)
+    Config is written to \$HOME/.config/spark-tools/ (or \$SPARK_CONFIG_DIR)
+  - Optional: SSH to dyad reachable within 2s (used only to confirm secondary
+    hostname; falls back to "dyad" with a WARNING if unreachable)
+  - Optional: QSFP network interface visible to 'ip link show'
+    (checked in order: enp1s0f0np0, enp1s0f1np1, ib0)
+
+USAGE
+=====
+  spark-init [--force]
+
+OPTIONS
+=======
+  --force    Overwrite existing cluster.env and model.env.
+             Without --force, existing files are skipped (safe to re-run
+             after a partial init or to check that files exist).
+             WARNING: --force discards any manual edits to both files.
+
+AUTO-DETECTION
+==============
+spark-init probes the environment and pre-fills cluster.env:
+
+  Hostname -> SPARK_PRIMARY_HOST
+    Uses \$(hostname). On monad this is "monad"; on dyad it is "dyad".
+
+  QSFP interface -> SPARK_QSFP_IFACE
+    Checks in order: enp1s0f0np0, enp1s0f1np1, ib0.
+    First interface found via 'ip link show' wins.
+    If none found: falls back to enp1s0f0np0 and prints a WARNING.
+
+  Secondary host -> SPARK_SECONDARY_HOST
+    If hostname is "monad"  -> sets "dyad"
+    If hostname is "dyad"   -> sets "monad"
+    Otherwise: SSH-probes candidates (dyad, monad, spark-2, spark-1) with
+    a 2-second ConnectTimeout each. Falls back to "dyad" with a WARNING.
+
+WHAT GETS WRITTEN
+=================
+cluster.env (from config/cluster.env.example with auto-detected substitutions):
+  SPARK_MODE              swarm       (default; use 'spark-mode ray' to switch)
+  SPARK_ENGINE            trtllm      (default; use 'spark-mode --engine vllm')
+  SPARK_PRIMARY_HOST      <detected hostname>
+  SPARK_SECONDARY_HOST    <detected secondary>
+  SPARK_QSFP_IFACE        <detected interface>
+  SPARK_PORT              8000
+  SPARK_TRTLLM_IMAGE      nvcr.io/nvidia/tensorrt-llm/release:spark-single-gpu-dev
+  SPARK_VLLM_IMAGE        nvcr.io/nvidia/vllm:25.09-py3
+  SPARK_RAY_VLLM_IMAGE    scitrera/dgx-spark-vllm:0.15.1-t5
+  SPARK_PROXY_ENABLED     false
+  SPARK_PROXY_PORT        9000
+
+model.env (copied verbatim from config/model.env.example — edit before use):
+  MODEL_NAME              nvidia/Qwen3-235B-A22B-FP4  (change to your model)
+  SERVED_MODEL_NAME       (empty — clients address model by full MODEL_NAME)
+  TP_SIZE                 2
+  MAX_MODEL_LEN           32768
+  GPU_MEM_UTIL            0.85
+  VLLM_EXTRA_ARGS         (pre-tuned for GB10 + FP8 KV cache + tool-calling)
+  TRTLLM_PORT             8355
+  TRTLLM_MAX_BATCH_SIZE   4
+  TRTLLM_MAX_NUM_TOKENS   32768
+  TRTLLM_GPU_MEM_FRACTION 0.9
+
+SIDE EFFECTS
+============
+  - Creates ${CONFIG_DIR}/ (mkdir -p, no-op if it already exists)
+  - Writes cluster.env (skipped if present and no --force)
+  - Writes model.env (skipped if present and no --force)
+  - Does NOT start any services
+  - Does NOT write anything to dyad (SSH used only for secondary host detection)
+
+AFTER RUNNING
+=============
+Mandatory: review and edit both config files before running any other command.
+
+  1. Edit ${CONFIG_DIR}/cluster.env
+       Verify SPARK_PRIMARY_HOST, SPARK_SECONDARY_HOST, SPARK_QSFP_IFACE.
+       Change SPARK_MODE=ray and SPARK_ENGINE=vllm if you want Ray+vLLM.
+
+  2. Edit ${CONFIG_DIR}/model.env
+       Set MODEL_NAME to the model you want to serve.
+       Adjust TP_SIZE, MAX_MODEL_LEN, GPU_MEM_UTIL for your hardware.
+
+  3. For split topology, create per-node override files:
+       cp <spark-tools>/config/node.env.monad.example \\
+           ${CONFIG_DIR}/node.env.monad
+       cp <spark-tools>/config/node.env.dyad.example \\
+           ${CONFIG_DIR}/node.env.dyad
+       These are loaded by 'sudo spark-mode split' to set per-node TP_SIZE,
+       GPU_MEM_UTIL, MAX_MODEL_LEN, and VLLM_EXTRA_ARGS independently
+       for each node (e.g. monad=131072 context, dyad=262144 context).
+
+CONFIG LOAD ORDER (reference)
+==============================
+Every spark command loads config in this priority order (later wins):
+  1. cluster.env    — orchestration mode, engine, hosts, network, images
+  2. model.env      — model identity, TP size, memory, vLLM/TRT-LLM flags
+  3. node.env       — per-node overrides, loaded in ascending priority:
+       /etc/spark-tools/node.env             (system-level, lowest priority)
+       ~/.config/spark-tools/node.env        (user-level generic)
+       ~/.config/spark-tools/node.env.<host> (host-specific, highest priority)
+
+EXAMPLES
+========
+Fresh installation on monad:
+  \$ spark-init
+  === Spark Tools Initialization ===
+
+  Config directory: ${CONFIG_DIR}
+  Detected hostname: monad
+  Detected QSFP interface: enp1s0f0np0
+  Detected secondary host: dyad
+
+  Created: ${CONFIG_DIR}/cluster.env
+  Created: ${CONFIG_DIR}/model.env
+
+  === Initialization Complete ===
+
+  Edit your config:
+    ${CONFIG_DIR}/cluster.env   - cluster settings (mode, hosts, network)
+    ${CONFIG_DIR}/model.env     - model settings (model, parallelism, memory)
+
+  Quick start:
+    spark-mode              - show current mode
+    spark-mode ray          - switch to Ray mode
+    spark-serve             - start serving configured model
+    spark-status            - check cluster health
+
+Re-run on existing install (safe — skips existing files without --force):
+  \$ spark-init
+  === Spark Tools Initialization ===
+
+  Config directory: ${CONFIG_DIR}
+  Detected hostname: monad
+  Detected QSFP interface: enp1s0f0np0
+  Detected secondary host: dyad
+
+  cluster.env already exists (use --force to overwrite)
+  model.env already exists (use --force to overwrite)
+
+  === Initialization Complete ===
+
+Reset config to defaults (overwrites both files — manual edits are lost):
+  \$ spark-init --force
+  ...
+  Created: ${CONFIG_DIR}/cluster.env
+  Created: ${CONFIG_DIR}/model.env
+  ...
+
+No QSFP interface detected (warning + fallback):
+  \$ spark-init
+  ...
+  WARNING: No QSFP interface detected (checked enp1s0f0np0, enp1s0f1np1, ib0)
+  ...
+  (cluster.env is still written; SPARK_QSFP_IFACE=enp1s0f0np0 as fallback —
+   correct it manually before activating cluster or split topology)
+
+EXIT CODES
+==========
+  0   Always — spark-init does not fail on auto-detection warnings.
+      Missing QSFP interface or unreachable secondary host are printed as
+      WARNINGs; safe fallback values are used and init completes normally.
+
+SEE ALSO
+========
+  spark-help          Full list of spark commands with descriptions
+  spark-mode          View or switch orchestration mode and topology
+  spark-set-model     Change the active model after initialization
+  spark-serve         Start inference services once config is ready
+  spark-status        Verify cluster connectivity and model health
+EOF
     exit 0
 fi
 

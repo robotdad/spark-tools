@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# spark-check - Mode-aware cluster health checker
+#
+# Checks services, endpoints, and model availability.
+# Color coded: green=OK  yellow=WARN  red=FAIL
+#
+# Handles split, ray, and swarm modes inline so the summary
+# line always appears at the end regardless of mode.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat <<'EOF'
+spark-check — Mode-aware health check for the Spark cluster
+
+Runs a structured suite of checks against systemd services, Docker
+orchestration state, HTTP health endpoints, GPU utilization, and the active
+model — then prints a color-coded summary and exits 0 (all clear) or 1 (any
+failure). Unlike spark-status, this script runs entirely inline without
+backend dispatch, so the summary line always appears at the end and the exit
+code is always meaningful.
+
+Use spark-check: after spark-serve to poll until the model has loaded, after
+spark-stop to confirm services are down, after spark-reset to verify recovery,
+or any time you need a definitive pass/fail answer about cluster health.
+
+Note: spark-check supports split, ray, and swarm modes. split mode is a
+legacy/standalone mode (two independent vLLM instances with a proxy load
+balancer) not managed by spark-serve/spark-stop — it is checked here for
+completeness.
+
+Usage:
+  spark-check
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists  (run spark-init to create it)
+  - SSH access to dyad (SPARK_SECONDARY_HOST) for remote service checks;
+    uses ConnectTimeout=5s — a timeout counts as a FAIL for that check
+  - curl available locally for HTTP health probes (5s timeout per request)
+  - nvidia-smi available on monad for GPU checks (warns if absent, no failure)
+
+Mode-specific checks performed:
+
+  SPLIT mode  (two independent vLLM instances + proxy load balancer):
+    monad services:  vllm-standalone, vllm-proxy, open-webui  (systemd)
+    dyad services:   vllm-standalone  (systemd, checked via SSH)
+    HTTP endpoints:  monad :${SPARK_PORT}/health
+                     dyad  :${SPARK_PORT}/health
+                     proxy :${SPARK_PROXY_PORT:-9000}/health
+    Proxy registry:  GET proxy :${SPARK_PROXY_PORT:-9000}/v1/models
+                     reports count of registered models
+
+  RAY mode  (Ray distributed runtime + vLLM tensor-parallel across both GPUs):
+    monad services:  vllm-ray-head, vllm, vllm-proxy, open-webui  (systemd)
+    dyad services:   vllm-ray-worker  (systemd, checked via SSH)
+    Ray container:   docker exec ${RAY_CONTAINER:-spark-ray} ray status
+                     reports node count; prints Active/Pending/alive/dead lines
+    HTTP endpoint:   monad :${SPARK_PORT}/health
+
+  SWARM mode  (Docker Swarm + MPI, supports trtllm or vllm engine):
+    monad services:  vllm-proxy, open-webui  (systemd)
+    Docker Swarm:    docker info LocalNodeState must equal 'active'
+                     docker node ls printed as: hostname: Status (Availability)
+    Stack 'spark':   docker stack ls must contain 'spark'
+                     docker stack services spark printed as: name, replicas, image
+    HTTP endpoint:   monad :${spark_effective_port}/health
+                       vllm engine:    uses SPARK_PORT      (default 8000)
+                       trtllm engine:  uses TRTLLM_PORT     (default 8355)
+
+  ALL modes (always run after mode-specific checks):
+    GPU snapshot:    nvidia-smi on monad — index, name, mem used/total MiB,
+                     utilization %, temperature °C (one line per GPU)
+    Active model:    MODEL_NAME, TP_SIZE, MAX_MODEL_LEN from loaded config;
+                     SERVED_MODEL_NAME alias if set; then a live query to
+                     http://localhost:${SPARK_PORT}/v1/models to confirm what
+                     is actually serving (prints model ID if endpoint responds)
+
+Color coding:
+  Green  ✓   Check passed (service active, HTTP 200, Swarm active, etc.)
+  Yellow ~   Warning — service degraded, endpoint not yet up, non-critical miss
+  Red    ✗   Failure — service down, SSH unreachable, no HTTP response,
+             Swarm not active
+
+Output structure:
+  === Spark Cluster Health Check ===
+      Mode: <mode>   Primary: <host>   Secondary: <host>
+
+  --- Services: monad (head) ---
+  --- Services: dyad (worker) ---
+  --- Health Endpoints ---          (or mode-specific section name)
+  --- [Mode-specific section] ---   (Ray cluster, Docker Swarm, Docker Stack)
+  --- GPU (monad) ---
+  --- Active Model ---
+
+  === <N> passed  <W> warning(s)  <F> FAILURE(S)  [<T> total] ===
+
+Examples:
+  # One-shot health check
+  spark-check
+
+  # Poll in a script until the cluster is ready after spark-serve
+  until spark-check; do
+    echo "Waiting for cluster..."; sleep 10
+  done
+
+  # Use exit code in automation
+  if spark-check; then
+    echo "Cluster healthy — proceeding"
+  else
+    echo "Cluster has failures — check output above"
+    spark-reset
+  fi
+
+Exit codes:
+  0   All checks passed or only warnings  (FAIL count == 0)
+  1   One or more checks resulted in FAIL  (any red ✗ item in output)
+
+See also:
+  spark-status     Backend-native service status (dispatched, no GPU/model checks)
+  spark-serve      Start inference services
+  spark-stop       Stop inference services
+  spark-reset      Stop + restart cycle
+  spark-help       Comprehensive quick reference for all spark-tools commands
+EOF
+    exit 0
+fi
+
+spark_load_config
+
+# ---------------------------------------------------------------------------
+# Check counters
+# ---------------------------------------------------------------------------
+PASS=0
+FAIL=0
+WARN=0
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Check a local systemd service
+_svc_local() {
+    local label="$1" service="$2"
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        _green "  ✓ ${label}"
+        PASS=$(( PASS + 1 ))
+    else
+        _red   "  ✗ ${label}  [DOWN]"
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+# Check a remote systemd service via SSH
+_svc_remote() {
+    local label="$1" host="$2" service="$3"
+    if spark_ssh "$host" "systemctl is-active --quiet ${service}" 2>/dev/null; then
+        _green "  ✓ ${label}"
+        PASS=$(( PASS + 1 ))
+    else
+        _red   "  ✗ ${label}  [DOWN or unreachable]"
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+# Check an HTTP health endpoint (expects HTTP 200)
+_http() {
+    local label="$1" url="$2"
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000")
+    if [[ "$code" == "200" ]]; then
+        _green  "  ✓ ${label}  [HTTP 200]"
+        PASS=$(( PASS + 1 ))
+    elif [[ "$code" == "000" ]]; then
+        _red    "  ✗ ${label}  [no response]"
+        FAIL=$(( FAIL + 1 ))
+    else
+        _yellow "  ~ ${label}  [HTTP ${code}]"
+        WARN=$(( WARN + 1 ))
+    fi
+}
+
+# Check SSH reachability
+_ssh_reachable() {
+    local host="$1"
+    if spark_ssh "$host" "true" 2>/dev/null; then
+        _green  "  ✓ SSH reachable: ${host}"
+        PASS=$(( PASS + 1 ))
+        return 0
+    else
+        _red    "  ✗ SSH unreachable: ${host}"
+        FAIL=$(( FAIL + 1 ))
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+echo ""
+_bold "=== Spark Cluster Health Check ==="
+printf "    Mode: %-10s Primary: %-10s Secondary: %s\n" \
+    "${SPARK_MODE}" "${SPARK_PRIMARY_HOST}" "${SPARK_SECONDARY_HOST}"
+echo ""
+
+# ---------------------------------------------------------------------------
+# SPLIT MODE
+# ---------------------------------------------------------------------------
+if [[ "$SPARK_MODE" == "split" ]]; then
+
+    PORT="${SPARK_PORT:-8000}"
+    PROXY_PORT="${SPARK_PROXY_PORT:-9000}"
+
+    # --- Primary node services ---
+    _bold "--- Services: ${SPARK_PRIMARY_HOST} (head) ---"
+    _svc_local "vllm-standalone  (${SPARK_PRIMARY_HOST})" "vllm-standalone"
+    _svc_local "vllm-proxy       (load balancer)"         "vllm-proxy"
+    _svc_local "open-webui"                               "open-webui"
+    echo ""
+
+    # --- Secondary node reachability + service ---
+    _bold "--- Services: ${SPARK_SECONDARY_HOST} (worker) ---"
+    if _ssh_reachable "$SPARK_SECONDARY_HOST"; then
+        _svc_remote "vllm-standalone  (${SPARK_SECONDARY_HOST})" \
+            "$SPARK_SECONDARY_HOST" "vllm-standalone"
+    fi
+    echo ""
+
+    # --- HTTP health endpoints ---
+    _bold "--- Health Endpoints ---"
+    _http "${SPARK_PRIMARY_HOST}   vLLM  :${PORT}"  "http://localhost:${PORT}/health"
+    _http "${SPARK_SECONDARY_HOST} vLLM  :${PORT}"  "http://${SPARK_SECONDARY_HOST}:${PORT}/health"
+    _http "Proxy / LB             :${PROXY_PORT}"   "http://localhost:${PROXY_PORT}/health"
+    echo ""
+
+    # --- Load balancer model registry ---
+    _bold "--- Load Balancer ---"
+    LB_RAW=$(curl -s --max-time 5 "http://localhost:${PROXY_PORT}/v1/models" 2>/dev/null || true)
+    if [[ -n "$LB_RAW" ]]; then
+        LB_COUNT=$(echo "$LB_RAW" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',[])))" \
+            2>/dev/null || echo "?")
+        _green "  ✓ Proxy model registry: ${LB_COUNT} model(s) registered"
+        PASS=$(( PASS + 1 ))
+    else
+        _yellow "  ~ Proxy model registry: unavailable"
+        WARN=$(( WARN + 1 ))
+    fi
+
+# ---------------------------------------------------------------------------
+# RAY MODE
+# ---------------------------------------------------------------------------
+elif [[ "$SPARK_MODE" == "ray" ]]; then
+
+    PORT="${SPARK_PORT:-8000}"
+
+    # --- Primary node services ---
+    _bold "--- Services: ${SPARK_PRIMARY_HOST} (head) ---"
+    _svc_local "vllm-ray-head  (${SPARK_PRIMARY_HOST})"  "vllm-ray-head"
+    _svc_local "vllm           (${SPARK_PRIMARY_HOST})"  "vllm"
+    _svc_local "vllm-proxy"                              "vllm-proxy"
+    _svc_local "open-webui"                              "open-webui"
+    echo ""
+
+    # --- Secondary node ---
+    _bold "--- Services: ${SPARK_SECONDARY_HOST} (worker) ---"
+    if _ssh_reachable "$SPARK_SECONDARY_HOST"; then
+        _svc_remote "vllm-ray-worker  (${SPARK_SECONDARY_HOST})" \
+            "$SPARK_SECONDARY_HOST" "vllm-ray-worker"
+    fi
+    echo ""
+
+    # --- Ray cluster status (container) ---
+    _bold "--- Ray Cluster ---"
+    RAY_CONTAINER="${RAY_CONTAINER:-spark-ray}"
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${RAY_CONTAINER}$"; then
+        RAY_NODES=$(docker exec "$RAY_CONTAINER" ray status 2>/dev/null \
+            | grep -c "node_" 2>/dev/null || echo "0")
+        _green "  ✓ Ray container '${RAY_CONTAINER}' running  (${RAY_NODES} node(s) reported)"
+        PASS=$(( PASS + 1 ))
+        docker exec "$RAY_CONTAINER" ray status 2>/dev/null \
+            | grep -E "(Active|Pending|alive|dead)" \
+            | head -8 \
+            | sed 's/^/    /' || true
+    else
+        _yellow "  ~ Ray container '${RAY_CONTAINER}' not found"
+        WARN=$(( WARN + 1 ))
+    fi
+    echo ""
+
+    # --- API health ---
+    _bold "--- Health Endpoint ---"
+    _http "vLLM API  :${PORT}" "http://localhost:${PORT}/health"
+
+# ---------------------------------------------------------------------------
+# SWARM MODE
+# ---------------------------------------------------------------------------
+elif [[ "$SPARK_MODE" == "swarm" ]]; then
+
+    PORT="$(spark_effective_port)"
+
+    # --- Primary node services ---
+    _bold "--- Services: ${SPARK_PRIMARY_HOST} ---"
+    _svc_local "vllm-proxy"  "vllm-proxy"
+    _svc_local "open-webui"  "open-webui"
+    echo ""
+
+    # --- Docker Swarm state ---
+    _bold "--- Docker Swarm ---"
+    SWARM_STATE=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "unknown")
+    if [[ "$SWARM_STATE" == "active" ]]; then
+        _green "  ✓ Swarm active"
+        PASS=$(( PASS + 1 ))
+        docker node ls --format "    {{.Hostname}}: {{.Status}} ({{.Availability}})" \
+            2>/dev/null || true
+    else
+        _red "  ✗ Swarm not active  [state: ${SWARM_STATE}]"
+        FAIL=$(( FAIL + 1 ))
+    fi
+    echo ""
+
+    # --- Stack services ---
+    _bold "--- Docker Stack: spark ---"
+    if docker stack ls 2>/dev/null | grep -q "^spark"; then
+        _green "  ✓ Stack 'spark' deployed"
+        PASS=$(( PASS + 1 ))
+        docker stack services spark \
+            --format "    {{.Name}}: {{.Replicas}} replicas  [{{.Image}}]" \
+            2>/dev/null | head -10 || true
+    else
+        _yellow "  ~ Stack 'spark' not found"
+        WARN=$(( WARN + 1 ))
+    fi
+    echo ""
+
+    # --- API health ---
+    _bold "--- Health Endpoint ---"
+    _http "vLLM API  :${PORT}" "http://localhost:${PORT}/health"
+
+# ---------------------------------------------------------------------------
+# UNKNOWN MODE
+# ---------------------------------------------------------------------------
+else
+    _yellow "  ~ Unknown SPARK_MODE: '${SPARK_MODE}'"
+    _yellow "    Expected: split | ray | swarm"
+    WARN=$(( WARN + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Common: GPU snapshot (local only)
+# ---------------------------------------------------------------------------
+echo ""
+_bold "--- GPU (${SPARK_PRIMARY_HOST}) ---"
+if command -v nvidia-smi &>/dev/null; then
+    nvidia-smi \
+        --query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu \
+        --format=csv,noheader,nounits 2>/dev/null \
+        | awk -F', ' '{
+            printf "  GPU %s: %s  mem=%s/%s MiB  util=%s%%  temp=%s°C\n",
+                $1, $2, $3, $4, $5, $6
+        }' || true
+else
+    _yellow "  ~ nvidia-smi not available"
+    WARN=$(( WARN + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Common: Active model
+# ---------------------------------------------------------------------------
+echo ""
+_bold "--- Active Model ---"
+if [[ -n "${MODEL_NAME:-}" ]]; then
+    printf "  Model:   %s\n"  "${MODEL_NAME}"
+    printf "  TP:      %-6s  MaxLen: %s\n" "${TP_SIZE:-?}" "${MAX_MODEL_LEN:-?}"
+    [[ -n "${SERVED_MODEL_NAME:-}" ]] && printf "  Alias:   %s\n" "${SERVED_MODEL_NAME}"
+
+    # Try to confirm what's actually serving
+    ACTIVE_PORT="${SPARK_PORT:-8000}"
+    SERVING_RAW=$(curl -s --max-time 5 "http://localhost:${ACTIVE_PORT}/v1/models" 2>/dev/null || true)
+    if [[ -n "$SERVING_RAW" ]]; then
+        SERVING_ID=$(echo "$SERVING_RAW" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])" \
+            2>/dev/null || echo "")
+        [[ -n "$SERVING_ID" ]] && printf "  Serving: %s  (live)\n" "$SERVING_ID"
+    fi
+else
+    _yellow "  ~ No model configured"
+    _yellow "    Check: ${SPARK_MODEL_ENV}"
+    WARN=$(( WARN + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo ""
+TOTAL=$(( PASS + FAIL + WARN ))
+if [[ $FAIL -eq 0 && $WARN -eq 0 ]]; then
+    _green "=== All ${PASS}/${TOTAL} checks passed ==="
+elif [[ $FAIL -eq 0 ]]; then
+    _yellow "=== ${PASS} passed  ${WARN} warning(s)  0 failures  [${TOTAL} total] ==="
+else
+    _red   "=== ${PASS} passed  ${WARN} warning(s)  ${FAIL} FAILURE(S)  [${TOTAL} total] ==="
+fi
+echo ""
+
+# Non-zero exit if any failures
+[[ $FAIL -eq 0 ]]

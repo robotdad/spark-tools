@@ -5,15 +5,97 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-install-services [--mode swarm|ray] [--dry-run]"
-    echo ""
-    echo "Install systemd service units for the specified mode."
-    echo "Requires sudo for writing to /etc/systemd/system/."
-    echo ""
-    echo "Options:"
-    echo "  --mode MODE    Install services for this mode (default: current SPARK_MODE)"
-    echo "  --dry-run      Show what would be installed without writing files"
-    echo "  --uninstall    Remove installed services"
+    cat <<'EOF'
+spark-install-services — install systemd service units for the spark inference stack
+
+Generates systemd unit files from templates in the spark-tools systemd/ directory,
+substituting live values (username, paths, IPs, interface names) into {{PLACEHOLDER}}
+tokens, then writes the rendered units to /etc/systemd/system/ and reloads the daemon.
+
+WHY: systemd units enable automatic service startup on boot, restart-on-failure
+semantics, and clean shutdown of the Ray or Docker Swarm containers. Run this
+command once per node after 'spark-init' to register the correct services for
+your orchestration mode and node role.
+
+Usage:
+  spark-install-services [--mode MODE] [--dry-run] [--uninstall]
+
+Options:
+  --mode MODE    Orchestration mode to install services for:
+                   swarm  — installs spark-swarm-stack.service on the manager
+                            node (monad). dyad joins the swarm overlay network
+                            and requires no unit of its own.
+                   ray    — auto-detects node role by comparing $(hostname)
+                            against SPARK_PRIMARY_HOST from cluster.env:
+                              monad (head)   → spark-ray-head.service
+                                               spark-ray-vllm.service
+                              dyad (worker)  → spark-ray-worker.service
+                 Default: SPARK_MODE read from ~/.config/spark-tools/cluster.env.
+
+  --dry-run      Preview mode. Prints the fully-rendered unit file contents to
+                 stdout without writing any files or running systemctl. Does not
+                 require sudo. Safe to run at any time.
+
+  --uninstall    Stop, disable, and remove all spark-* service units from
+                 /etc/systemd/system/:
+                   spark-swarm-stack  spark-ray-head
+                   spark-ray-worker   spark-ray-vllm
+                 Runs 'sudo systemctl daemon-reload' after removal. Combine
+                 with --dry-run to preview which units would be removed.
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env must exist. Run 'spark-init' first.
+  - sudo is required (units are written to /etc/systemd/system/).
+  - --dry-run operates without sudo.
+
+Template substitutions:
+  Templates live in <spark-tools>/systemd/*.service.template.
+  The following tokens are replaced at install time:
+    {{USERNAME}}        current user (whoami)
+    {{SPARK_TOOLS_DIR}} absolute path to the spark-tools repo
+    {{COMPOSE_FILE}}    ~/docker-compose.yml
+    {{QSFP_IFACE}}      SPARK_QSFP_IFACE from cluster.env
+    {{HEAD_IP}}         IP on SPARK_QSFP_IFACE (falls back to first LAN IP)
+    {{RAY_VLLM_IMAGE}}  SPARK_RAY_VLLM_IMAGE from cluster.env (or image default)
+    {{PORT}}            SPARK_PORT from cluster.env (default: 8000)
+
+Side effects (non-dry-run):
+  - Unit file(s) written to /etc/systemd/system/<name>.service
+  - 'sudo systemctl daemon-reload' is run automatically.
+  - Services are NOT enabled or started — use the printed commands to do so.
+
+Exit codes:
+  0  Templates processed and units installed (or uninstalled) successfully.
+  1  Unknown option, missing --mode value, invalid mode, or cluster.env absent.
+
+Examples:
+  # Preview rendered unit files without writing anything (no sudo needed):
+  spark-install-services --dry-run
+
+  # Install services for swarm mode (reads SPARK_MODE from cluster.env):
+  spark-install-services
+
+  # Explicitly install for ray mode (node role auto-detected from hostname):
+  spark-install-services --mode ray
+
+  # After ray install on monad — enable and start:
+  sudo systemctl enable spark-ray-head spark-ray-vllm
+  sudo systemctl start  spark-ray-head
+  sudo systemctl start  spark-ray-vllm    # waits for Ray head to be ready
+
+  # After swarm install on monad — enable and start:
+  sudo systemctl enable --now spark-swarm-stack
+
+  # Remove all spark service units:
+  spark-install-services --uninstall
+
+See also:
+  spark-init              create cluster.env and model.env (prerequisite)
+  spark-install-extras    add PATH symlinks, MOTD, and auth proxy
+  spark-status            verify services are healthy after startup
+  spark-help              full command reference
+  install.sh              unified one-shot installer (preferred for first installs)
+EOF
     exit 0
 fi
 

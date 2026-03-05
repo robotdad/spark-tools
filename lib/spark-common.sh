@@ -23,8 +23,20 @@ spark_error() { _red "ERROR: $*" >&2; }
 spark_die()   { spark_error "$@"; exit 1; }
 
 # --- Config Loading ---
+#
+# Load order (last value for a given key wins):
+#   1. cluster.env  — orchestration mode, engine, host names, network, images
+#   2. model.env    — model identity, TP size, memory, vLLM/TRT-LLM flags
+#   3. node.env     — per-node overrides (TP_SIZE=1, GPU_MEM_UTIL, etc.)
+#
+# node.env is loaded by spark_load_node_env(), called automatically at the
+# end of spark_load_config(). It sources (in ascending priority):
+#   /etc/spark-tools/node.env                    — system-level node override
+#   ~/.config/spark-tools/node.env               — user-level generic override
+#   ~/.config/spark-tools/node.env.<hostname>    — user-level host-specific override
+#
 spark_load_config() {
-    # Load cluster config
+    # 1. Load cluster config (required)
     if [[ ! -f "$SPARK_CLUSTER_ENV" ]]; then
         spark_die "Cluster config not found: $SPARK_CLUSTER_ENV
 Run 'spark-init' to create it."
@@ -32,13 +44,16 @@ Run 'spark-init' to create it."
     # shellcheck source=/dev/null
     source "$SPARK_CLUSTER_ENV"
 
-    # Load model config (optional - some commands don't need it)
+    # 2. Load model config (optional — some commands don't need it)
     if [[ -f "$SPARK_MODEL_ENV" ]]; then
         # shellcheck source=/dev/null
         source "$SPARK_MODEL_ENV"
     fi
 
-    # Apply env var overrides (env vars beat config file)
+    # 3. Load node-specific overrides (optional — overrides model.env values)
+    spark_load_node_env
+
+    # Apply defaults for any vars not set by any config file or environment
     SPARK_MODE="${SPARK_MODE:-swarm}"
     SPARK_ENGINE="${SPARK_ENGINE:-trtllm}"
     SPARK_PRIMARY_HOST="${SPARK_PRIMARY_HOST:-$(hostname)}"
@@ -53,6 +68,38 @@ Run 'spark-init' to create it."
     export VLLM_EXTRA_ARGS TRTLLM_PORT TRTLLM_MAX_BATCH_SIZE
     export TRTLLM_MAX_NUM_TOKENS TRTLLM_GPU_MEM_FRACTION
     export SERVED_MODEL_NAME
+}
+
+# --- Node-specific env loading ---
+# Sources per-node override files in ascending priority order so that the
+# most specific file (host-named) always wins.  All files are optional.
+# Call this after model.env is loaded; node.env values intentionally shadow
+# model.env settings (e.g. dropping TP_SIZE from 2 → 1 in split mode).
+spark_load_node_env() {
+    local node_hostname
+    node_hostname="$(hostname -s)"
+
+    # System-level generic override (lowest priority among node files)
+    if [[ -f "/etc/spark-tools/node.env" ]]; then
+        # shellcheck source=/dev/null
+        source "/etc/spark-tools/node.env"
+    fi
+
+    # User-level generic override
+    if [[ -f "${SPARK_CONFIG_DIR}/node.env" ]]; then
+        # shellcheck source=/dev/null
+        source "${SPARK_CONFIG_DIR}/node.env"
+    fi
+
+    # User-level host-specific override (highest priority)
+    # e.g. ~/.config/spark-tools/node.env.monad or node.env.dyad
+    if [[ -f "${SPARK_CONFIG_DIR}/node.env.${node_hostname}" ]]; then
+        # shellcheck source=/dev/null
+        source "${SPARK_CONFIG_DIR}/node.env.${node_hostname}"
+    fi
+
+    # Re-export model-related vars in case node.env changed them
+    export MODEL_NAME TP_SIZE MAX_MODEL_LEN GPU_MEM_UTIL VLLM_EXTRA_ARGS SERVED_MODEL_NAME
 }
 
 # --- Validation ---

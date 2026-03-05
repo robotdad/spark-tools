@@ -4,30 +4,615 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
+#=============================================================================
+# spark-mode — orchestration + topology switcher
+#=============================================================================
+# TWO independent concepts, one command:
+#
+#   ORCHESTRATION (updates cluster.env; no services touched):
+#     spark-mode swarm [--engine trtllm|vllm]
+#     spark-mode ray
+#
+#   TOPOLOGY (operational; starts/stops real services; requires sudo):
+#     sudo spark-mode split     — two independent vLLM instances (TP=1/node)
+#     sudo spark-mode cluster   — Ray TP=2 cluster across monad + dyad
+#          spark-mode status    — show current topology + service states
+#=============================================================================
+
+# ─── Help ────────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: spark-mode [swarm|ray] [--engine trtllm|vllm]"
-    echo ""
-    echo "View or switch cluster orchestration mode."
-    echo ""
-    echo "With no arguments, shows current mode and engine."
-    echo ""
-    echo "Modes:"
-    echo "  swarm   Docker Swarm + MPI (supports trtllm and vllm)"
-    echo "  ray     Ray cluster (supports vllm only)"
-    echo ""
-    echo "Options:"
-    echo "  --engine ENGINE   Also switch inference engine (trtllm or vllm)"
-    echo ""
-    echo "Examples:"
-    echo "  spark-mode                    # show current mode"
-    echo "  spark-mode ray                # switch to ray mode"
-    echo "  spark-mode swarm --engine trtllm   # switch to swarm + trtllm"
+    cat << 'EOF'
+spark-mode — view or switch cluster orchestration mode and deployment topology
+
+TWO INDEPENDENT CONCEPTS, ONE COMMAND
+======================================
+This command handles two separate concerns dispatched by the first argument:
+
+  ORCHESTRATION (swarm, ray)
+    Which scheduler manages the inference stack.
+    Writes SPARK_MODE and SPARK_ENGINE to ~/.config/spark-tools/cluster.env.
+    Does NOT touch running services — you must stop/restart them manually.
+    No sudo required.
+
+  TOPOLOGY (split, cluster, status)
+    Physical arrangement of services across monad (primary) and dyad (worker).
+    Operationally stops/starts real systemd services on both nodes.
+    Uses SSH to reach dyad for remote operations.
+    split and cluster require sudo (systemd unit installation needs root).
+    status does not require sudo.
+
+With no arguments: prints current configuration from cluster.env + model.env.
+
+USAGE
+=====
+  spark-mode                           Show current configuration
+  spark-mode swarm [--engine ENGINE]   Switch to Swarm orchestration (config only)
+  spark-mode ray                       Switch to Ray orchestration (config only)
+  sudo spark-mode split                Activate split topology (live service ops)
+  sudo spark-mode cluster              Activate cluster topology (live service ops)
+  spark-mode status                    Show topology and live service states
+
+PRECONDITIONS
+=============
+For orchestration commands (swarm, ray):
+  - spark-init must have been run; ~/.config/spark-tools/cluster.env must exist
+
+For topology commands (split, cluster):
+  - sudo access on monad (invoke as: sudo spark-mode split/cluster)
+  - Passwordless SSH from monad to dyad as $SUDO_USER (the operator account)
+  - dyad reachable at SPARK_SECONDARY_HOST (default: dyad)
+  - For split: MODEL_NAME must be set in model.env
+  - For split: model weights already downloaded on dyad at:
+      ~/.cache/huggingface/hub/models--<Org>--<ModelName>/
+
+ORCHESTRATION COMMANDS
+======================
+  swarm               Docker Swarm + MPI orchestration.
+                      Supports both trtllm and vllm engines.
+                      Required for TRT-LLM (MPI handles multi-node transport).
+
+  ray                 Ray cluster orchestration.
+                      Supports vllm engine only.
+                      If --engine trtllm is also given, engine is silently
+                      corrected to vllm with a warning (ray + trtllm is invalid).
+
+  --engine ENGINE     Also change the inference engine. Values: trtllm, vllm.
+                      Without this flag, the current engine is kept unchanged.
+
+TOPOLOGY COMMANDS
+=================
+  split               Two independent vLLM instances, one per node (TP=1 each).
+                      monad runs spark-vllm-standalone independently.
+                      dyad  runs spark-vllm-standalone independently.
+                      The proxy load-balances across both nodes.
+                      Best for: high throughput / double request capacity when
+                      the model fits in a single GB10's memory.
+
+                      Performs 10 steps:
+                        [1/10] SSH preflight — verify dyad is reachable
+                        [2/10] Model cache check — verify model weights on dyad
+                        [3/10] Stop Ray/Swarm services on monad (stop+disable)
+                        [4/10] Stop Ray services on dyad (via SSH sudo)
+                        [5/10] Remove stale containers on both nodes (docker rm -f)
+                        [6/10] Install spark-vllm-standalone.service on monad
+                               (rendered from systemd/ template with substituted vars)
+                        [7/10] Install node.env on monad
+                               (from ~/.config/spark-tools/node.env.monad, or
+                                writes TP_SIZE=1 as fallback if file not found)
+                        [8/10] Install spark-vllm-standalone.service on dyad
+                               (piped via SSH sudo tee)
+                        [9/10] Sync model.env + node.env to dyad
+                               (node.env sourced from node.env.dyad, or TP_SIZE=1)
+                       [10/10] Enable + start spark-vllm-standalone on both nodes;
+                               restart spark-proxy; write "split" to topology file
+
+  cluster             Ray TP=2 cluster: one model sharded across monad + dyad.
+                      monad runs spark-ray-head + spark-ray-vllm (TP=2 driver).
+                      dyad  runs spark-ray-worker (connects back to head IP).
+                      GPU-to-GPU tensor traffic flows over QSFP (SPARK_QSFP_IFACE).
+                      Best for: models too large for one node, or when lowest
+                      single-request latency matters more than parallel throughput.
+
+                      Performs 9 steps:
+                        [1/9] Stop spark-vllm-standalone on monad (stop+disable)
+                        [2/9] Stop spark-vllm-standalone on dyad (via SSH sudo)
+                        [3/9] Remove stale containers on both nodes (docker rm -f)
+                        [4/9] Remove per-node node.env overrides on both nodes
+                        [5/9] Install spark-ray-head.service + spark-ray-vllm.service
+                              on monad (rendered from systemd/ templates)
+                        [6/9] Install spark-ray-worker.service on dyad
+                              (piped via SSH sudo tee)
+                        [7/9] daemon-reload; start spark-ray-head; wait 5s;
+                              start spark-ray-worker on dyad; wait 10s for join
+                        [8/9] Enable + start spark-ray-vllm on monad
+                        [9/9] Restart spark-proxy; write "cluster" to topology file
+
+  status              Show current topology and live systemd service states.
+                      Reads ~/.config/spark-tools/topology for declared topology.
+                      Default topology is "cluster" if the file does not exist.
+                      SSHes to dyad to check its service states.
+                      Does not require sudo.
+
+                      In split topology, checks on each node:
+                        spark-vllm-standalone
+                      In cluster topology, checks:
+                        monad: spark-ray-head, spark-ray-vllm
+                        dyad:  spark-ray-worker
+                      Always checks: spark-proxy (on monad)
+
+TOPOLOGY FILE
+=============
+The active topology is persisted to:
+  ~/.config/spark-tools/topology
+
+Written by split/cluster on success. Contains "split" or "cluster".
+If absent, "cluster" is assumed (the more complex/default configuration).
+
+SERVICE TEMPLATES
+=================
+Systemd unit files are rendered from templates at install time:
+  <spark-tools>/systemd/spark-vllm-standalone.service.template
+  <spark-tools>/systemd/spark-ray-head.service.template
+  <spark-tools>/systemd/spark-ray-vllm.service.template
+  <spark-tools>/systemd/spark-ray-worker.service.template
+
+Template variables substituted:
+  {{USERNAME}} {{HEAD_IP}} {{QSFP_IFACE}} {{RAY_VLLM_IMAGE}} {{VLLM_IMAGE}} {{PORT}}
+
+EXAMPLES
+========
+Show current configuration (no arguments):
+  $ spark-mode
+  Spark Tools Configuration
+    Mode:      ray
+    Engine:    vllm
+    Primary:   monad
+    Secondary: dyad
+    QSFP:      enp1s0f0np0
+    API Port:  8000
+    Model:     nvidia/Qwen3-235B-A22B-FP4
+    TP Size:   2
+    Context:   32768
+    GPU Mem:   0.85
+
+Switch to Ray orchestration (config only, services not touched):
+  $ spark-mode ray
+  Switching: swarm+trtllm → ray+vllm
+  WARNING: Ray mode does not support trtllm. Switching engine to vllm.
+  Updated: /home/user/.config/spark-tools/cluster.env
+  Note: vLLM uses port 8000 by default
+
+  Current orchestration mode: ray + vllm
+
+  If services are running, stop and restart them:
+    spark-stop && spark-serve
+
+Switch to Swarm + TRT-LLM (config only, services not touched):
+  $ spark-mode swarm --engine trtllm
+  Switching: ray+vllm → swarm+trtllm
+  Updated: /home/user/.config/spark-tools/cluster.env
+  Note: TRT-LLM uses port 8355 by default
+
+  Current orchestration mode: swarm + trtllm
+
+  If services are running, stop and restart them:
+    spark-stop && spark-serve
+
+Activate split topology (live — installs services, requires sudo):
+  $ sudo spark-mode split
+  Switching to SPLIT mode (two independent vLLM instances, TP=1 per node)...
+
+  [1/10] Pre-flight: verifying SSH connectivity to dyad...
+  ==> SSH to dyad: OK
+  [2/10] Pre-flight: checking model cache on dyad...
+  ==> Model cache found on dyad: OK
+  [3/10] Stopping cluster services on monad...
+  [4/10] Stopping cluster services on dyad...
+  [5/10] Removing stale containers on both nodes...
+  [6/10] Installing spark-vllm-standalone.service on monad...
+  [7/10] Installing node.env on monad...
+  ==> Installed ~/.config/spark-tools/node.env.monad → node.env
+  [8/10] Installing spark-vllm-standalone.service on dyad...
+  [9/10] Syncing model.env + node.env to dyad...
+  ==> Synced node.env.dyad → dyad:~/.config/spark-tools/node.env
+  [10/10] Enabling and starting services on both nodes...
+
+  Split mode active.
+    monad → vLLM standalone on port 8000 (TP=1)
+    dyad  → vLLM standalone on port 8000 (TP=1)
+
+  Run 'spark-mode status' to verify service states.
+
+Activate cluster topology (live — installs services, requires sudo):
+  $ sudo spark-mode cluster
+  Switching to CLUSTER mode (Ray TP=2 across monad + dyad)...
+
+  [1/9] Stopping standalone services on monad...
+  [2/9] Stopping standalone services on dyad...
+  [3/9] Removing stale containers on both nodes...
+  [4/9] Removing per-node overrides (node.env)...
+  [5/9] Installing Ray services on monad...
+  [6/9] Installing spark-ray-worker.service on dyad...
+  [7/9] Starting Ray cluster...
+  ==> Waiting 5s for Ray head to initialise...
+  ==> Waiting 10s for Ray worker to join...
+  [8/9] Starting vLLM (Ray distributed backend)...
+  [9/9] Restarting proxy and saving topology...
+
+  Cluster mode active.
+    Ray head  → monad  (192.168.1.10)
+    Ray worker→ dyad   (dyad)
+    vLLM      → monad  (TP=2 distributed)
+
+  Run 'spark-mode status' to verify service states.
+
+Check live service states:
+  $ spark-mode status
+  Spark Topology
+    Current topology: split
+
+  === monad (primary) ===
+    spark-vllm-standalone: active
+
+  === dyad (secondary) ===
+    spark-vllm-standalone: active
+
+  spark-proxy: active
+
+EXIT CODES
+==========
+  0   Success
+  1   Error — SSH unreachable, model cache missing on dyad, config not found,
+      MODEL_NAME not set, sudo not used for split/cluster, unknown argument
+
+SEE ALSO
+========
+  spark-help          Full list of spark commands with descriptions
+  spark-init          Initialize configuration (must run before spark-mode)
+  spark-set-model     Change the active model (split mode: restarts services)
+  spark-serve         Start inference services (after orchestration mode change)
+  spark-stop          Stop inference services
+  spark-status        Check cluster and API endpoint health
+EOF
     exit 0
 fi
 
+#=============================================================================
+# TOPOLOGY COMMANDS — split / cluster / status
+# These are dispatched early; they load config then hand off to helpers below.
+#=============================================================================
+case "${1:-}" in
+    split|cluster|status)
+        spark_load_config
+
+        # When invoked via sudo, SUDO_USER is the real operator account.
+        # All user-facing paths (config, cache, home) use that account.
+        _SPARK_USER="${SUDO_USER:-$USER}"
+        _SPARK_HOME="$(eval echo "~${_SPARK_USER}")"
+        _SPARK_CFG="${_SPARK_HOME}/.config/spark-tools"
+        _TOPOLOGY_FILE="${_SPARK_CFG}/topology"
+        _TEMPLATE_DIR="${SPARK_TOOLS_DIR}/systemd"
+        _DYAD="${SPARK_SECONDARY_HOST:-dyad}"
+
+        # ── Helpers ──────────────────────────────────────────────────────────
+
+        _detect_head_ip() {
+            ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K[\d.]+' \
+                || ip addr show \
+                   | grep -oP 'inet \K[\d.]+' \
+                   | grep -v '^127\.' | grep -v '^172\.' | grep -v '^169\.254\.' \
+                   | head -1
+        }
+
+        # Substitute all template placeholders.
+        # Reads _HEAD_IP, _SPARK_USER, etc. from the calling scope.
+        _process_template() {
+            local template="$1"
+            sed \
+                -e "s|{{USERNAME}}|${_SPARK_USER}|g" \
+                -e "s|{{HEAD_IP}}|${_HEAD_IP:-}|g" \
+                -e "s|{{QSFP_IFACE}}|${SPARK_QSFP_IFACE:-enp1s0f0np0}|g" \
+                -e "s|{{RAY_VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
+                -e "s|{{VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
+                -e "s|{{PORT}}|${SPARK_PORT:-8000}|g" \
+                "$template"
+        }
+
+        # SSH wrapper targeting dyad.
+        _ssh_dyad() {
+            spark_ssh "${_DYAD}" "$@"
+        }
+
+        _current_topology() {
+            if [[ -f "${_TOPOLOGY_FILE}" ]]; then
+                cat "${_TOPOLOGY_FILE}"
+            else
+                echo "cluster"
+            fi
+        }
+
+        _save_topology() {
+            mkdir -p "${_SPARK_CFG}"
+            echo "$1" > "${_TOPOLOGY_FILE}"
+        }
+
+        # ── status ────────────────────────────────────────────────────────────
+        _do_status() {
+            local topo
+            topo="$(_current_topology)"
+            _bold "Spark Topology"
+            echo "  Current topology: ${topo}"
+            echo ""
+
+            if [[ "$topo" == "split" ]]; then
+                echo "=== monad (primary) ==="
+                if systemctl is-active --quiet spark-vllm-standalone 2>/dev/null; then
+                    _green "  spark-vllm-standalone: active"
+                else
+                    _yellow "  spark-vllm-standalone: inactive"
+                fi
+
+                echo ""
+                echo "=== dyad (secondary) ==="
+                if _ssh_dyad "systemctl is-active --quiet spark-vllm-standalone" 2>/dev/null; then
+                    _green "  spark-vllm-standalone: active"
+                else
+                    _yellow "  spark-vllm-standalone: inactive or unreachable"
+                fi
+            else
+                echo "=== monad (primary) ==="
+                if systemctl is-active --quiet spark-ray-head 2>/dev/null; then
+                    _green "  spark-ray-head: active"
+                else
+                    _yellow "  spark-ray-head: inactive"
+                fi
+                if systemctl is-active --quiet spark-ray-vllm 2>/dev/null; then
+                    _green "  spark-ray-vllm: active"
+                else
+                    _yellow "  spark-ray-vllm: inactive"
+                fi
+
+                echo ""
+                echo "=== dyad (secondary) ==="
+                if _ssh_dyad "systemctl is-active --quiet spark-ray-worker" 2>/dev/null; then
+                    _green "  spark-ray-worker: active"
+                else
+                    _yellow "  spark-ray-worker: inactive or unreachable"
+                fi
+            fi
+
+            echo ""
+            if systemctl is-active --quiet spark-proxy 2>/dev/null; then
+                _green "spark-proxy: active"
+            else
+                _yellow "spark-proxy: inactive"
+            fi
+        }
+
+        # ── split ─────────────────────────────────────────────────────────────
+        _do_split() {
+            if [[ $EUID -ne 0 ]]; then
+                spark_die "spark-mode split requires sudo (systemd service installation needs root)."
+            fi
+
+            if [[ -z "${MODEL_NAME:-}" ]]; then
+                spark_die "MODEL_NAME is not set. Check ${_SPARK_CFG}/model.env"
+            fi
+
+            # Derive HuggingFace hub cache dir from model name.
+            # "Org/ModelName" → "models--Org--ModelName"
+            local cache_dir model_cache
+            cache_dir="models--$(echo "${MODEL_NAME}" | sed 's|/|--|g')"
+            model_cache="${_SPARK_HOME}/.cache/huggingface/hub/${cache_dir}"
+
+            _HEAD_IP="$(_detect_head_ip)"
+
+            echo "Switching to SPLIT mode (two independent vLLM instances, TP=1 per node)..."
+            echo ""
+
+            # ── [1/10] Pre-flight: SSH connectivity ──────────────────────────
+            echo "[1/10] Pre-flight: verifying SSH connectivity to dyad..."
+            if ! _ssh_dyad "true" 2>/dev/null; then
+                spark_die "Cannot reach dyad via SSH. Check SSH keys and network connectivity."
+            fi
+            spark_info "SSH to dyad: OK"
+
+            # ── [2/10] Pre-flight: model cache on dyad ───────────────────────
+            echo "[2/10] Pre-flight: checking model cache on dyad..."
+            if ! _ssh_dyad "test -d '${model_cache}'" 2>/dev/null; then
+                echo ""
+                spark_error "Model cache not found on dyad at:"
+                echo "  ${model_cache}"
+                echo ""
+                echo "Download the model on dyad first:"
+                echo "  ssh ${_DYAD}"
+                echo "  docker run --rm --gpus all \\"
+                echo "    -v ${_SPARK_HOME}/.cache/huggingface:/root/.cache/huggingface \\"
+                echo "    ${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5} \\"
+                echo "    huggingface-cli download ${MODEL_NAME}"
+                echo ""
+                exit 1
+            fi
+            spark_info "Model cache found on dyad: OK"
+
+            # ── [3/10] Stop cluster services on monad ────────────────────────
+            echo "[3/10] Stopping cluster services on monad..."
+            systemctl stop  spark-ray-vllm   2>/dev/null || true
+            systemctl stop  spark-ray-head   2>/dev/null || true
+            systemctl disable spark-ray-vllm 2>/dev/null || true
+            systemctl disable spark-ray-head 2>/dev/null || true
+            # Swarm stack (if running)
+            systemctl stop  spark-swarm-stack   2>/dev/null || true
+            systemctl disable spark-swarm-stack 2>/dev/null || true
+
+            # ── [4/10] Stop cluster services on dyad ─────────────────────────
+            echo "[4/10] Stopping cluster services on dyad..."
+            _ssh_dyad "sudo systemctl stop spark-ray-worker    2>/dev/null || true; \
+                       sudo systemctl disable spark-ray-worker 2>/dev/null || true"
+
+            # ── [5/10] Remove stale containers on both nodes ─────────────────
+            echo "[5/10] Removing stale containers on both nodes..."
+            docker rm -f spark-ray spark-vllm 2>/dev/null || true
+            _ssh_dyad "docker rm -f spark-ray spark-vllm 2>/dev/null || true"
+
+            # ── [6/10] Install standalone service on monad ───────────────────
+            echo "[6/10] Installing spark-vllm-standalone.service on monad..."
+            _process_template "${_TEMPLATE_DIR}/spark-vllm-standalone.service.template" \
+                > /etc/systemd/system/spark-vllm-standalone.service
+
+            # ── [7/10] Install node.env on monad ─────────────────────────────
+            echo "[7/10] Installing node.env on monad..."
+            local monad_node_env="${_SPARK_CFG}/node.env.${SPARK_PRIMARY_HOST:-monad}"
+            if [[ -f "${monad_node_env}" ]]; then
+                cp "${monad_node_env}" "${_SPARK_CFG}/node.env"
+                spark_info "Installed ${monad_node_env} → ${_SPARK_CFG}/node.env"
+            else
+                spark_warn "No per-node override found at ${monad_node_env}"
+                spark_warn "Copy config/node.env.monad.example to ${monad_node_env} to tune per-node settings."
+                # Write a minimal fallback so the service at least reads TP_SIZE=1
+                printf 'TP_SIZE=1\n' > "${_SPARK_CFG}/node.env"
+            fi
+
+            # ── [8/10] Install standalone service on dyad ────────────────────
+            echo "[8/10] Installing spark-vllm-standalone.service on dyad..."
+            _process_template "${_TEMPLATE_DIR}/spark-vllm-standalone.service.template" \
+                | _ssh_dyad "sudo tee /etc/systemd/system/spark-vllm-standalone.service > /dev/null"
+
+            # ── [9/10] Sync config files to dyad ─────────────────────────────
+            echo "[9/10] Syncing model.env + node.env to dyad..."
+            _ssh_dyad "mkdir -p '${_SPARK_CFG}'"
+            # Sync model.env so dyad knows what model to serve
+            cat "${_SPARK_CFG}/model.env" \
+                | _ssh_dyad "cat > '${_SPARK_CFG}/model.env'"
+            # Sync dyad-specific node.env
+            local dyad_node_env="${_SPARK_CFG}/node.env.${_DYAD}"
+            if [[ -f "${dyad_node_env}" ]]; then
+                cat "${dyad_node_env}" \
+                    | _ssh_dyad "cat > '${_SPARK_CFG}/node.env'"
+                spark_info "Synced ${dyad_node_env} → dyad:${_SPARK_CFG}/node.env"
+            else
+                spark_warn "No per-node override found at ${dyad_node_env}"
+                spark_warn "Copy config/node.env.dyad.example to ${dyad_node_env} to tune dyad settings."
+                printf 'TP_SIZE=1\n' | _ssh_dyad "cat > '${_SPARK_CFG}/node.env'"
+            fi
+
+            # ── [10/10] Enable + start services; save topology ────────────────
+            echo "[10/10] Enabling and starting services on both nodes..."
+            systemctl daemon-reload
+            _ssh_dyad "sudo systemctl daemon-reload"
+
+            systemctl enable spark-vllm-standalone
+            systemctl start  spark-vllm-standalone
+            _ssh_dyad "sudo systemctl enable spark-vllm-standalone; \
+                       sudo systemctl start  spark-vllm-standalone"
+
+            # Restart proxy if it is already running
+            systemctl restart spark-proxy 2>/dev/null || true
+
+            _save_topology "split"
+
+            echo ""
+            _green "Split mode active."
+            echo "  monad → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
+            echo "  dyad  → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
+            echo ""
+            echo "Run 'spark-mode status' to verify service states."
+        }
+
+        # ── cluster ───────────────────────────────────────────────────────────
+        _do_cluster() {
+            if [[ $EUID -ne 0 ]]; then
+                spark_die "spark-mode cluster requires sudo (systemd service installation needs root)."
+            fi
+
+            _HEAD_IP="$(_detect_head_ip)"
+
+            echo "Switching to CLUSTER mode (Ray TP=2 across monad + dyad)..."
+            echo ""
+
+            # ── [1/9] Stop standalone on monad ───────────────────────────────
+            echo "[1/9] Stopping standalone services on monad..."
+            systemctl stop    spark-vllm-standalone 2>/dev/null || true
+            systemctl disable spark-vllm-standalone 2>/dev/null || true
+
+            # ── [2/9] Stop standalone on dyad ────────────────────────────────
+            echo "[2/9] Stopping standalone services on dyad..."
+            _ssh_dyad "sudo systemctl stop    spark-vllm-standalone 2>/dev/null || true; \
+                       sudo systemctl disable spark-vllm-standalone 2>/dev/null || true"
+
+            # ── [3/9] Remove stale containers on both nodes ──────────────────
+            echo "[3/9] Removing stale containers on both nodes..."
+            docker rm -f spark-ray spark-vllm 2>/dev/null || true
+            _ssh_dyad "docker rm -f spark-ray spark-vllm 2>/dev/null || true"
+
+            # ── [4/9] Remove per-node overrides ──────────────────────────────
+            echo "[4/9] Removing per-node overrides (node.env)..."
+            rm -f "${_SPARK_CFG}/node.env"
+            _ssh_dyad "rm -f '${_SPARK_CFG}/node.env'" 2>/dev/null || true
+
+            # ── [5/9] Install Ray services on monad ──────────────────────────
+            echo "[5/9] Installing Ray services on monad..."
+            _process_template "${_TEMPLATE_DIR}/spark-ray-head.service.template" \
+                > /etc/systemd/system/spark-ray-head.service
+            _process_template "${_TEMPLATE_DIR}/spark-ray-vllm.service.template" \
+                > /etc/systemd/system/spark-ray-vllm.service
+
+            # ── [6/9] Install Ray worker service on dyad ─────────────────────
+            echo "[6/9] Installing spark-ray-worker.service on dyad..."
+            _process_template "${_TEMPLATE_DIR}/spark-ray-worker.service.template" \
+                | _ssh_dyad "sudo tee /etc/systemd/system/spark-ray-worker.service > /dev/null"
+
+            # ── [7/9] Start Ray cluster ───────────────────────────────────────
+            echo "[7/9] Starting Ray cluster..."
+            systemctl daemon-reload
+            _ssh_dyad "sudo systemctl daemon-reload"
+
+            systemctl enable spark-ray-head
+            systemctl start  spark-ray-head
+            spark_info "Waiting 5s for Ray head to initialise..."
+            sleep 5
+
+            _ssh_dyad "sudo systemctl enable spark-ray-worker; \
+                       sudo systemctl start  spark-ray-worker"
+            spark_info "Waiting 10s for Ray worker to join..."
+            sleep 10
+
+            # ── [8/9] Start vLLM on monad ────────────────────────────────────
+            echo "[8/9] Starting vLLM (Ray distributed backend)..."
+            systemctl enable spark-ray-vllm
+            systemctl start  spark-ray-vllm
+
+            # ── [9/9] Restart proxy + save topology ──────────────────────────
+            echo "[9/9] Restarting proxy and saving topology..."
+            systemctl restart spark-proxy 2>/dev/null || true
+            _save_topology "cluster"
+
+            echo ""
+            _green "Cluster mode active."
+            echo "  Ray head  → monad  (${_HEAD_IP})"
+            echo "  Ray worker→ dyad   (${_DYAD})"
+            echo "  vLLM      → monad  (TP=2 distributed)"
+            echo ""
+            echo "Run 'spark-mode status' to verify service states."
+        }
+
+        # ── Dispatch topology command ─────────────────────────────────────────
+        case "$1" in
+            split)   _do_split   ;;
+            cluster) _do_cluster ;;
+            status)  _do_status  ;;
+        esac
+        exit 0
+        ;;
+esac
+
+#=============================================================================
+# ORCHESTRATION COMMANDS — swarm / ray (update cluster.env only)
+#=============================================================================
+
 spark_load_config
 
-# No arguments: show current mode
+# No arguments: show current configuration
 if [[ $# -eq 0 ]]; then
     spark_show_config
     exit 0
@@ -39,23 +624,29 @@ NEW_ENGINE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         swarm|ray) NEW_MODE="$1" ;;
-        --engine) shift; NEW_ENGINE="${1:-}"; [[ -z "$NEW_ENGINE" ]] && spark_die "--engine requires a value" ;;
-        *) spark_die "Unknown argument: $1. Use --help for usage." ;;
+        --engine)
+            shift
+            NEW_ENGINE="${1:-}"
+            [[ -z "$NEW_ENGINE" ]] && spark_die "--engine requires a value (trtllm or vllm)"
+            ;;
+        *)
+            spark_die "Unknown argument: $1. Use --help for usage."
+            ;;
     esac
     shift
 done
 
-# Apply defaults
+# Apply defaults (keep current values if not specified)
 NEW_MODE="${NEW_MODE:-$SPARK_MODE}"
 NEW_ENGINE="${NEW_ENGINE:-$SPARK_ENGINE}"
 
-# Auto-correct engine for ray mode
+# Auto-correct: ray + trtllm is not a valid combination
 if [[ "$NEW_MODE" == "ray" && "$NEW_ENGINE" == "trtllm" ]]; then
     spark_warn "Ray mode does not support trtllm. Switching engine to vllm."
     NEW_ENGINE="vllm"
 fi
 
-# Validate
+# Nothing changed
 if [[ "$NEW_MODE" == "$SPARK_MODE" && "$NEW_ENGINE" == "$SPARK_ENGINE" ]]; then
     echo "Already in ${NEW_MODE} + ${NEW_ENGINE} mode. No change."
     exit 0
@@ -73,7 +664,7 @@ sed -i \
 echo "Updated: $SPARK_CLUSTER_ENV"
 echo ""
 
-# Auto-adjust port defaults in model.env when switching engines
+# Engine-change port hints
 if [[ "$NEW_ENGINE" != "$SPARK_ENGINE" ]]; then
     if [[ "$NEW_ENGINE" == "trtllm" ]]; then
         spark_info "Note: TRT-LLM uses port ${TRTLLM_PORT:-8355} by default"
@@ -83,7 +674,7 @@ if [[ "$NEW_ENGINE" != "$SPARK_ENGINE" ]]; then
 fi
 
 echo ""
-echo "Current mode is now: ${NEW_MODE} + ${NEW_ENGINE}"
+echo "Current orchestration mode: ${NEW_MODE} + ${NEW_ENGINE}"
 echo ""
 echo "If services are running, stop and restart them:"
 echo "  spark-stop && spark-serve"
