@@ -91,21 +91,21 @@ TOPOLOGY COMMANDS
                       the model fits in a single GB10's memory.
 
                       Performs 10 steps:
-                        [1/10] SSH preflight — verify dyad is reachable
-                        [2/10] Model cache check — verify model weights on dyad
-                        [3/10] Stop Ray/Swarm services on monad (stop+disable)
-                        [4/10] Stop Ray services on dyad (via SSH sudo)
-                        [5/10] Remove stale containers on both nodes (docker rm -f)
-                        [6/10] Install spark-vllm-standalone.service on monad
+                        [1/12] SSH preflight — verify dyad is reachable
+                        [2/12] Model cache check — verify model weights on dyad
+                        [3/12] Stop Ray/Swarm services on monad (stop+disable)
+                        [4/12] Stop Ray services on dyad (via SSH sudo)
+                        [5/12] Remove stale containers on both nodes (docker rm -f)
+                        [6/12] Install spark-vllm-standalone.service on monad
                                (rendered from systemd/ template with substituted vars)
-                        [7/10] Install node.env on monad
+                        [7/12] Install node.env on monad
                                (from ~/.config/spark-tools/node.env.monad, or
                                 writes TP_SIZE=1 as fallback if file not found)
-                        [8/10] Install spark-vllm-standalone.service on dyad
+                        [8/12] Install spark-vllm-standalone.service on dyad
                                (piped via SSH sudo tee)
-                        [9/10] Sync model.env + node.env to dyad
+                        [11/12] Sync model.env + node.env to dyad
                                (node.env sourced from node.env.dyad, or TP_SIZE=1)
-                       [10/10] Enable + start spark-vllm-standalone on both nodes;
+                       [12/12] Enable + start spark-vllm-standalone on both nodes;
                                restart spark-proxy; write "split" to topology file
 
   cluster             Ray TP=2 cluster: one model sharded across monad + dyad.
@@ -204,20 +204,20 @@ Activate split topology (live — installs services, requires sudo):
   $ sudo spark-mode split
   Switching to SPLIT mode (two independent vLLM instances, TP=1 per node)...
 
-  [1/10] Pre-flight: verifying SSH connectivity to dyad...
+  [1/12] Pre-flight: verifying SSH connectivity to dyad...
   ==> SSH to dyad: OK
-  [2/10] Pre-flight: checking model cache on dyad...
+  [2/12] Pre-flight: checking model cache on dyad...
   ==> Model cache found on dyad: OK
-  [3/10] Stopping cluster services on monad...
-  [4/10] Stopping cluster services on dyad...
-  [5/10] Removing stale containers on both nodes...
-  [6/10] Installing spark-vllm-standalone.service on monad...
-  [7/10] Installing node.env on monad...
+  [3/12] Stopping cluster services on monad...
+  [4/12] Stopping cluster services on dyad...
+  [5/12] Removing stale containers on both nodes...
+  [6/12] Installing spark-vllm-standalone.service on monad...
+  [7/12] Installing node.env on monad...
   ==> Installed ~/.config/spark-tools/node.env.monad → node.env
-  [8/10] Installing spark-vllm-standalone.service on dyad...
-  [9/10] Syncing model.env + node.env to dyad...
+  [8/12] Installing spark-vllm-standalone.service on dyad...
+  [11/12] Syncing model.env + node.env to dyad...
   ==> Synced node.env.dyad → dyad:~/.config/spark-tools/node.env
-  [10/10] Enabling and starting services on both nodes...
+  [12/12] Enabling and starting services on both nodes...
 
   Split mode active.
     monad → vLLM standalone on port 8000 (TP=1)
@@ -317,6 +317,10 @@ case "${1:-}" in
                 -e "s|{{RAY_VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
                 -e "s|{{VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
                 -e "s|{{PORT}}|${SPARK_PORT:-8000}|g" \
+                -e "s|{{UPSTREAM_PORT}}|${SPARK_PORT:-8000}|g" \
+                -e "s|{{PROXY_PORT}}|${SPARK_PROXY_PORT:-9000}|g" \
+                -e "s|{{SPARK_TOOLS_DIR}}|${SPARK_TOOLS_DIR}|g" \
+                -e "s|{{VLLM_BACKENDS}}|${_VLLM_BACKENDS:-http://localhost:${SPARK_PORT:-8000}}|g" \
                 "$template"
         }
 
@@ -431,15 +435,15 @@ case "${1:-}" in
             # Auto-resolve port before starting services.
             spark_resolve_port
 
-            # ── [1/10] Pre-flight: SSH connectivity ──────────────────────────
-            echo "[1/10] Pre-flight: verifying SSH connectivity to dyad..."
+            # ── [1/12] Pre-flight: SSH connectivity ──────────────────────────
+            echo "[1/12] Pre-flight: verifying SSH connectivity to dyad..."
             if ! _ssh_dyad "true" 2>/dev/null; then
                 spark_die "Cannot reach dyad via SSH. Check SSH keys and network connectivity."
             fi
             spark_info "SSH to dyad: OK"
 
-            # ── [2/10] Pre-flight: model cache on dyad ───────────────────────
-            echo "[2/10] Pre-flight: checking model cache on dyad..."
+            # ── [2/12] Pre-flight: model cache on dyad ───────────────────────
+            echo "[2/12] Pre-flight: checking model cache on dyad..."
             if ! _ssh_dyad "test -d '${model_cache}'" 2>/dev/null; then
                 echo ""
                 spark_error "Model cache not found on dyad at:"
@@ -456,8 +460,8 @@ case "${1:-}" in
             fi
             spark_info "Model cache found on dyad: OK"
 
-            # ── [3/10] Stop cluster services on monad ────────────────────────
-            echo "[3/10] Stopping cluster services on monad..."
+            # ── [3/12] Stop cluster services on monad ────────────────────────
+            echo "[3/12] Stopping cluster services on monad..."
             systemctl stop  spark-ray-vllm   2>/dev/null || true
             systemctl stop  spark-ray-head   2>/dev/null || true
             systemctl disable spark-ray-vllm 2>/dev/null || true
@@ -466,23 +470,23 @@ case "${1:-}" in
             systemctl stop  spark-swarm-stack   2>/dev/null || true
             systemctl disable spark-swarm-stack 2>/dev/null || true
 
-            # ── [4/10] Stop cluster services on dyad ─────────────────────────
-            echo "[4/10] Stopping cluster services on dyad..."
+            # ── [4/12] Stop cluster services on dyad ─────────────────────────
+            echo "[4/12] Stopping cluster services on dyad..."
             _ssh_dyad_tty "sudo systemctl stop spark-ray-worker    2>/dev/null || true; \
                           sudo systemctl disable spark-ray-worker 2>/dev/null || true"
 
-            # ── [5/10] Remove stale containers on both nodes ─────────────────
-            echo "[5/10] Removing stale containers on both nodes..."
+            # ── [5/12] Remove stale containers on both nodes ─────────────────
+            echo "[5/12] Removing stale containers on both nodes..."
             docker rm -f spark-ray spark-vllm 2>/dev/null || true
             _ssh_dyad "docker rm -f spark-ray spark-vllm 2>/dev/null || true"
 
-            # ── [6/10] Install standalone service on monad ───────────────────
-            echo "[6/10] Installing spark-vllm-standalone.service on monad..."
+            # ── [6/12] Install standalone service on monad ───────────────────
+            echo "[6/12] Installing spark-vllm-standalone.service on monad..."
             _process_template "${_TEMPLATE_DIR}/spark-vllm-standalone.service.template" \
                 > /etc/systemd/system/spark-vllm-standalone.service
 
-            # ── [7/10] Install node.env on monad ─────────────────────────────
-            echo "[7/10] Installing node.env on monad..."
+            # ── [7/12] Install node.env on monad ─────────────────────────────
+            echo "[7/12] Installing node.env on monad..."
             local monad_node_env="${_SPARK_CFG}/node.env.${SPARK_PRIMARY_HOST:-monad}"
             if [[ -f "${monad_node_env}" ]]; then
                 cp "${monad_node_env}" "${_SPARK_CFG}/node.env"
@@ -494,14 +498,39 @@ case "${1:-}" in
                 printf 'TP_SIZE=1\n' > "${_SPARK_CFG}/node.env"
             fi
 
-            # ── [8/10] Install standalone service on dyad ────────────────────
-            echo "[8/10] Installing spark-vllm-standalone.service on dyad..."
+            # ── [8/12] Install standalone service on dyad ────────────────────
+            echo "[8/12] Installing spark-vllm-standalone.service on dyad..."
             _process_template "${_TEMPLATE_DIR}/spark-vllm-standalone.service.template" \
                 | _ssh_dyad "cat > /tmp/.spark-service-tmp"
             _ssh_dyad_tty "sudo mv /tmp/.spark-service-tmp /etc/systemd/system/spark-vllm-standalone.service"
 
-            # ── [9/10] Sync config files to dyad ─────────────────────────────
-            echo "[9/10] Syncing model.env + node.env to dyad..."
+            # ── [11/12] Sync config files to dyad ─────────────────────────────
+
+            # -- [9/12] Install proxy service ----------------------------------
+            echo "[9/12] Installing spark-proxy.service on monad..."
+            _VLLM_BACKENDS="http://localhost:${SPARK_PORT:-8000},http://${_DYAD}:${SPARK_PORT:-8000}"
+            _process_template "${_TEMPLATE_DIR}/spark-proxy.service.template" \
+                > /etc/systemd/system/spark-proxy.service
+
+            # -- [10/12] Ensure proxy secret exists ----------------------------
+            echo "[10/12] Checking proxy secret..."
+            local _secret_dir="${_SPARK_HOME}/.config/vllm-proxy"
+            local _secret_file="${_secret_dir}/secret.env"
+            if [[ ! -f "${_secret_file}" ]]; then
+                spark_info "Generating proxy secret..."
+                sudo -u "${_SPARK_USER}" mkdir -p "${_secret_dir}"
+                sudo -u "${_SPARK_USER}" chmod 700 "${_secret_dir}"
+                local _new_secret
+                _new_secret="$(openssl rand -hex 32)"
+                echo "VLLM_PROXY_SECRET=${_new_secret}" \
+                    | sudo -u "${_SPARK_USER}" tee "${_secret_file}" > /dev/null
+                sudo -u "${_SPARK_USER}" chmod 600 "${_secret_file}"
+                spark_info "Secret written to ${_secret_file}"
+            else
+                spark_info "Proxy secret already exists: ${_secret_file}"
+            fi
+
+            echo "[11/12] Syncing model.env + node.env to dyad..."
             _ssh_dyad "mkdir -p '${_SPARK_CFG}'"
             # Sync model.env so dyad knows what model to serve
             cat "${_SPARK_CFG}/model.env" \
@@ -518,8 +547,8 @@ case "${1:-}" in
                 printf 'TP_SIZE=1\n' | _ssh_dyad "cat > '${_SPARK_CFG}/node.env'"
             fi
 
-            # ── [10/10] Enable + start services; save topology ────────────────
-            echo "[10/10] Enabling and starting services on both nodes..."
+            # ── [12/12] Enable + start services; save topology ────────────────
+            echo "[12/12] Enabling and starting services on both nodes..."
             systemctl daemon-reload
             _ssh_dyad_tty "sudo systemctl daemon-reload"
 
@@ -528,8 +557,9 @@ case "${1:-}" in
             _ssh_dyad_tty "sudo systemctl enable spark-vllm-standalone; \
                            sudo systemctl start  spark-vllm-standalone"
 
-            # Restart proxy if it is already running
-            systemctl restart spark-proxy 2>/dev/null || true
+            # Enable and start the proxy (installed in step 9/12)
+            systemctl enable spark-proxy
+            systemctl start  spark-proxy
 
             _save_topology "split"
 
@@ -537,6 +567,7 @@ case "${1:-}" in
             _green "Split mode active."
             echo "  monad → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
             echo "  dyad  → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
+            echo "  proxy → load balancer on port ${SPARK_PROXY_PORT:-9000}"
             echo ""
             # Nudge about per-node tuning if not yet configured
             local _cfg="${_SPARK_CFG}"

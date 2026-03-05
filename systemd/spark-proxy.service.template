@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User={{USERNAME}}
 EnvironmentFile=/home/{{USERNAME}}/.config/vllm-proxy/secret.env
-Environment=VLLM_BACKENDS=http://localhost:{{UPSTREAM_PORT}}
+Environment=VLLM_BACKENDS={{VLLM_BACKENDS}}
 WorkingDirectory={{SPARK_TOOLS_DIR}}/proxy
 ExecStart=/usr/bin/env python3 -m uvicorn vllm_proxy:app --host 0.0.0.0 --port {{PROXY_PORT}}
 Restart=always
