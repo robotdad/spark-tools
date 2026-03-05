@@ -577,6 +577,35 @@ case "${1:-}" in
             echo "  dyad  → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
             echo "  proxy → load balancer on port ${SPARK_PROXY_PORT:-9000}"
             echo ""
+
+            # Show connection details
+            local _proxy_port="${SPARK_PROXY_PORT:-9000}"
+            local _direct_port="${SPARK_PORT:-8000}"
+            local _model="${SERVED_MODEL_NAME:-${MODEL_NAME}}"
+            local _token=""
+            local _secret_file="${_SPARK_HOME}/.config/vllm-proxy/secret.env"
+            if [[ -f "${_secret_file}" ]]; then
+                _token="$(grep '^VLLM_PROXY_SECRET=' "${_secret_file}" | cut -d= -f2 | tr -d '"'"'")"
+            fi
+
+            _bold "Connect to this cluster:"
+            echo ""
+            echo "  API (load balanced):  http://${SPARK_PRIMARY_HOST}:${_proxy_port}/v1"
+            echo "  API (direct monad):   http://${SPARK_PRIMARY_HOST}:${_direct_port}/v1"
+            echo "  API (direct dyad):    http://${_DYAD}:${_direct_port}/v1"
+            echo "  Model:                ${_model}"
+            if [[ -n "${_token}" ]]; then
+                echo "  API key (proxy):      ${_token}"
+            fi
+            echo ""
+            echo "  Amplifier:"
+            echo "    amplifier provider add vllm \\"
+            echo "      --base-url http://${SPARK_PRIMARY_HOST}:${_proxy_port}/v1 \\"
+            if [[ -n "${_token}" ]]; then
+                echo "      --api-key ${_token} \\"
+            fi
+            echo "      --model ${_model}"
+            echo ""
             echo "Run 'spark-mode status' to verify service states."
         }
 
