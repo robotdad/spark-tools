@@ -523,6 +523,16 @@ case "${1:-}" in
             echo "  monad → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
             echo "  dyad  → vLLM standalone on port ${SPARK_PORT:-8000} (TP=1)"
             echo ""
+            # Nudge about per-node tuning if not yet configured
+            local _cfg="${_SPARK_CFG}"
+            if [[ ! -f "${_cfg}/node.env.${SPARK_PRIMARY_HOST:-monad}" ]] || \
+               [[ ! -f "${_cfg}/node.env.${_DYAD}" ]]; then
+                echo "Per-node tuning (recommended):"
+                echo "  cp config/node.env.monad.example ${_cfg}/node.env.${SPARK_PRIMARY_HOST:-monad}"
+                echo "  cp config/node.env.dyad.example  ${_cfg}/node.env.${_DYAD}"
+                echo "  Then re-run 'sudo -E spark-mode split' to apply."
+                echo ""
+            fi
             echo "Run 'spark-mode status' to verify service states."
         }
 
