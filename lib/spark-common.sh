@@ -165,11 +165,14 @@ spark_effective_port() {
 }
 
 # --- SSH helper ---
-# When running under sudo, SSH as the real operator (SUDO_USER) so that
-# the operator's ~/.ssh/authorized_keys are used, not root's.
+# When running under sudo, drop back to the real operator so SSH can
+# access their ~/.ssh/ keys and agent socket (root has neither).
 spark_ssh() {
     local host="$1"
     shift
-    local ssh_user="${SUDO_USER:-$USER}"
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "${ssh_user}@${host}" "$@"
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
+    else
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
+    fi
 }
