@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# spark-download - Pre-stage model weights on all cluster nodes
+#
+# Downloads HuggingFace model weights to the host cache on every node
+# so that spark-serve starts immediately without waiting for a download.
+# Downloads run in the background and survive SSH disconnects.
+#
+# The HuggingFace cache (~/.cache/huggingface/) is bind-mounted into all
+# inference containers (vLLM, Ray, TRT-LLM), so a host-level download
+# is visible to every engine.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "-h" ]]; then
+    cat << 'SHORT'
+Usage: spark-download <model-name> [OPTIONS]
+       spark-download --status [model-name] [OPTIONS]
+Pre-stage model weights on all cluster nodes (background download).
+
+  spark-download <model>           Download on all nodes (background)
+  spark-download --status [model]  Check download progress (default: current model)
+
+  --json     Machine-readable JSON output (with --status)
+  --node H   Operate on a single node only (hostname)
+  --force    Re-download even if cache already exists
+
+Use 'spark-download --help' for the extended reference (designed for AI agents like Amplifier).
+SHORT
+    exit 0
+fi
+if [[ "${1:-}" == "--help" ]]; then
+    cat << 'EOF'
+spark-download — pre-stage model weights on all cluster nodes
+
+Downloads HuggingFace model weights to the host cache on every node in the
+cluster.  This allows spark-serve to start immediately when you switch models,
+instead of blocking on a download that can take 30+ minutes for large models.
+
+Downloads run in the background via nohup and survive SSH disconnects.
+The HuggingFace cache (~/.cache/huggingface/) is bind-mounted into all
+inference containers (vLLM, Ray, TRT-LLM), so a host-level download is
+visible to every engine.
+
+WHAT IT DOES
+============
+Download mode (default):
+  For each target node (primary + secondary, or --node):
+    1. Checks if huggingface-cli is available on the node
+    2. Checks if model cache already exists (skips if complete, unless --force)
+    3. Starts 'huggingface-cli download MODEL' in the background (nohup)
+    4. Prints the log file path for monitoring
+
+Status mode (--status):
+  For each target node:
+    1. Probes the HuggingFace cache directory for the model
+    2. Reports: NOT_FOUND | IN_PROGRESS | COMPLETE
+    3. Shows file count, incomplete file count, and approximate size
+
+WHY
+===
+Without pre-staging, model downloads happen at spark-serve time:
+  - vLLM auto-downloads on first start (blocking; no progress visible)
+  - TRT-LLM refuses to start without a complete cache (hard exit 1)
+  - Split mode requires the model cached on BOTH nodes independently
+
+Pre-staging decouples "download" from "serve", reducing model switch downtime
+to load time only (seconds to minutes, not 30+ minutes).
+
+PRECONDITIONS
+=============
+  - spark-init must have been run (cluster.env must exist)
+  - huggingface-cli must be installed on each target node
+    (install: pip install huggingface-hub)
+  - For gated models (Llama, Gemma, etc.): export HF_TOKEN before running
+    (spark-download passes HF_TOKEN to remote nodes automatically)
+  - SSH access from primary to secondary node (for multi-node downloads)
+
+USAGE
+=====
+  spark-download <model-name> [OPTIONS]
+  spark-download --status [model-name] [OPTIONS]
+
+ARGUMENTS
+=========
+  model-name    HuggingFace repository ID.
+                Required for download; optional for --status (defaults to
+                MODEL_NAME from model.env).
+                Format: Org/ModelName
+                Example: nvidia/Qwen3-235B-A22B-FP4
+
+OPTIONS
+=======
+  --status          Check download status instead of starting a download.
+                    If model-name is omitted, uses MODEL_NAME from model.env.
+
+  --json            Emit machine-readable JSON instead of human-readable text.
+                    Only meaningful with --status.  JSON schema:
+                      {
+                        "model": "Org/Model",
+                        "ready": true|false,
+                        "nodes": [
+                          {
+                            "host": "monad",
+                            "role": "primary",
+                            "status": "COMPLETE|IN_PROGRESS|NOT_FOUND",
+                            "cache_path": "/home/.../models--Org--Model",
+                            "total_files": 42,
+                            "incomplete_files": 0,
+                            "size": "14G"
+                          }
+                        ]
+                      }
+                    Exit code 0 if ALL nodes are COMPLETE; 1 otherwise.
+
+  --node HOSTNAME   Operate on a single node only.  Use for targeted
+                    downloads or status checks.  HOSTNAME must be reachable
+                    via SSH (or be the local node).
+
+  --force           Start download even if the cache already exists and
+                    appears complete.  Useful after a corrupted download or
+                    when the model has been updated on HuggingFace.
+
+SIDE EFFECTS
+============
+  Download mode:
+    - Creates/updates ~/.cache/huggingface/hub/models--<Org>--<Model>/ on
+      each target node
+    - Writes download log to /tmp/spark-download-<Org>_<Model>.log on each node
+    - Passes HF_TOKEN to remote nodes if set in the environment
+
+  Status mode:
+    - Read-only; no files modified
+
+BEHAVIOR
+========
+  Downloads are started in the background on each node via nohup.  The command
+  returns immediately after launching all downloads.  Use --status to poll
+  progress.
+
+  A typical agent polling loop:
+
+    spark-download nvidia/Qwen3-235B-A22B-FP4
+    until spark-download --status nvidia/Qwen3-235B-A22B-FP4 --json | \
+        python3 -c "import sys,json; exit(0 if json.load(sys.stdin)['ready'] else 1)"; do
+      sleep 30
+    done
+    spark-set-model nvidia/Qwen3-235B-A22B-FP4
+    spark-stop && spark-serve
+
+  If --force is not set and the cache is already COMPLETE on a node, that
+  node is skipped with a message.
+
+EXAMPLES
+========
+Pre-stage a model on all nodes while the current model is still serving:
+  $ spark-download nvidia/Qwen3-235B-A22B-FP4
+  ==> Downloading nvidia/Qwen3-235B-A22B-FP4 on 2 node(s)...
+
+  --- monad (primary, local) ---
+    Starting background download...
+    Log: /tmp/spark-download-nvidia_Qwen3-235B-A22B-FP4.log
+    ✓ Download started (PID 12345)
+
+  --- dyad (secondary, via ssh) ---
+    Starting background download...
+    Log (on dyad): /tmp/spark-download-nvidia_Qwen3-235B-A22B-FP4.log
+    ✓ Download started
+
+  Poll progress with: spark-download --status nvidia/Qwen3-235B-A22B-FP4
+
+Check download status (human-readable):
+  $ spark-download --status nvidia/Qwen3-235B-A22B-FP4
+  Model: nvidia/Qwen3-235B-A22B-FP4
+
+  --- monad (primary) ---
+    Status:     COMPLETE
+    Cache:      /home/user/.cache/huggingface/hub/models--nvidia--Qwen3-235B-A22B-FP4
+    Files:      42 total, 0 incomplete
+    Size:       14G
+
+  --- dyad (secondary) ---
+    Status:     IN_PROGRESS
+    Cache:      /home/user/.cache/huggingface/hub/models--nvidia--Qwen3-235B-A22B-FP4
+    Files:      20 total, 5 incomplete
+    Size:       7.2G
+
+  Ready: NO (1 of 2 nodes complete)
+
+Check status with JSON output (for agent polling):
+  $ spark-download --status --json
+  {"model":"nvidia/Qwen3-235B-A22B-FP4","ready":false,"nodes":[...]}
+
+Download on a specific node only:
+  $ spark-download nvidia/Qwen3-235B-A22B-FP4 --node dyad
+
+Force re-download of an already-cached model:
+  $ spark-download nvidia/Qwen3-235B-A22B-FP4 --force
+
+Download a gated model (requires HuggingFace token):
+  $ export HF_TOKEN=hf_abc123...
+  $ spark-download meta-llama/Llama-3.3-70B-Instruct
+
+EXIT CODES
+==========
+  Download mode:
+    0   Downloads launched successfully on all target nodes (or skipped
+        because cache is already complete)
+    1   Config error, huggingface-cli not found on any target node, SSH
+        failure, or bad argument
+
+  Status mode:
+    0   All target nodes show COMPLETE
+    1   Any node is NOT_FOUND, IN_PROGRESS, UNREACHABLE, or unknown
+
+SEE ALSO
+========
+  spark-set-model   Change the active model (after download is complete)
+  spark-serve       Start inference services
+  spark-stop        Stop inference services
+  spark-check       Verify the API endpoint is responding correctly
+  spark-help        Full list of spark commands with descriptions
+EOF
+    echo ""
+    echo "For short help: $(basename "$0") -h"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+spark_load_config
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+MODEL=""
+STATUS_MODE=false
+JSON_OUTPUT=false
+NODE_FILTER=""
+FORCE=false
+
+# Two-pass parse: extract flags first, then handle --node (needs shift)
+# and positional args.
+REMAINING=()
+for arg in "$@"; do
+    case "$arg" in
+        --status)  STATUS_MODE=true ;;
+        --json)    JSON_OUTPUT=true ;;
+        --force)   FORCE=true ;;
+        *)         REMAINING+=("$arg") ;;
+    esac
+done
+
+set -- "${REMAINING[@]+"${REMAINING[@]}"}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --node)
+            shift
+            NODE_FILTER="${1:-}"
+            [[ -z "$NODE_FILTER" ]] && spark_die "--node requires a hostname"
+            ;;
+        -*)
+            spark_die "Unknown option: $1. Use --help for usage."
+            ;;
+        *)
+            [[ -n "$MODEL" ]] && spark_die "Unexpected argument: $1. Use --help for usage."
+            MODEL="$1"
+            ;;
+    esac
+    shift
+done
+
+# Default model from config if not specified
+if [[ -z "$MODEL" ]]; then
+    if [[ "$STATUS_MODE" == true && -n "${MODEL_NAME:-}" ]]; then
+        MODEL="$MODEL_NAME"
+    else
+        spark_die "Model name required. Use --help for usage."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Derived values
+# ---------------------------------------------------------------------------
+MODEL_CACHE_DIR="models--${MODEL//\//--}"
+SAFE_MODEL="${MODEL//\//_}"
+LOG_FILE="/tmp/spark-download-${SAFE_MODEL}.log"
+PRIMARY="${SPARK_PRIMARY_HOST}"
+SECONDARY="${SPARK_SECONDARY_HOST}"
+THIS_HOST="$(hostname -s)"
+
+# ---------------------------------------------------------------------------
+# Build node list
+# ---------------------------------------------------------------------------
+if [[ -n "$NODE_FILTER" ]]; then
+    TARGET_NODES=("$NODE_FILTER")
+else
+    TARGET_NODES=("$PRIMARY" "$SECONDARY")
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+is_local() {
+    local node="$1"
+    [[ "$node" == "$THIS_HOST" || "$node" == "$(hostname)" ]]
+}
+
+node_role() {
+    local node="$1"
+    if [[ "$node" == "$PRIMARY" ]]; then echo "primary"; else echo "secondary"; fi
+}
+
+# Check cache status on the local node.
+# Returns: STATUS|TOTAL_FILES|INCOMPLETE_FILES|SIZE|CACHE_PATH
+check_local_cache() {
+    local hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+    local cache="${hub}/${MODEL_CACHE_DIR}"
+
+    if [[ ! -d "$cache" ]]; then
+        echo "NOT_FOUND|0|0|0|${cache}"
+        return
+    fi
+
+    local inc total size
+    inc=$(find "$cache" -name "*.incomplete" 2>/dev/null | wc -l | tr -d ' ')
+    total=$(find "$cache" -type f 2>/dev/null | wc -l | tr -d ' ')
+    size=$(du -sh "$cache" 2>/dev/null | awk '{print $1}' || echo "?")
+
+    if [[ "$inc" -eq 0 && "$total" -gt 0 ]]; then
+        echo "COMPLETE|${total}|${inc}|${size:-?}|${cache}"
+    elif [[ "$inc" -gt 0 ]]; then
+        echo "IN_PROGRESS|${total}|${inc}|${size:-?}|${cache}"
+    else
+        echo "UNKNOWN|${total}|${inc}|${size:-?}|${cache}"
+    fi
+}
+
+# Check cache status on a remote node via SSH.
+# Returns: STATUS|TOTAL_FILES|INCOMPLETE_FILES|SIZE|CACHE_PATH
+check_remote_cache() {
+    local node="$1"
+    spark_ssh "$node" "
+        CACHE=\"\${HF_HOME:-\$HOME/.cache/huggingface}/hub/${MODEL_CACHE_DIR}\"
+        if [ ! -d \"\$CACHE\" ]; then
+            echo \"NOT_FOUND|0|0|0|\$CACHE\"
+            exit 0
+        fi
+        INC=\$(find \"\$CACHE\" -name '*.incomplete' 2>/dev/null | wc -l | tr -d ' ')
+        TOTAL=\$(find \"\$CACHE\" -type f 2>/dev/null | wc -l | tr -d ' ')
+        SZ=\$(du -sh \"\$CACHE\" 2>/dev/null | awk '{print \$1}' || echo '?')
+        if [ \"\$INC\" -eq 0 ] && [ \"\$TOTAL\" -gt 0 ]; then
+            echo \"COMPLETE|\$TOTAL|\$INC|\${SZ:-?}|\$CACHE\"
+        elif [ \"\$INC\" -gt 0 ]; then
+            echo \"IN_PROGRESS|\$TOTAL|\$INC|\${SZ:-?}|\$CACHE\"
+        else
+            echo \"UNKNOWN|\$TOTAL|\$INC|\${SZ:-?}|\$CACHE\"
+        fi
+    " 2>/dev/null
+}
+
+# Dispatch to local or remote cache check.
+check_node_cache() {
+    local node="$1"
+    if is_local "$node"; then
+        check_local_cache
+    else
+        check_remote_cache "$node"
+    fi
+}
+
+# ===========================================================================
+# STATUS MODE
+# ===========================================================================
+if [[ "$STATUS_MODE" == true ]]; then
+    all_complete=true
+    complete_count=0
+    total_count=${#TARGET_NODES[@]}
+    json_nodes=""
+
+    [[ "$JSON_OUTPUT" != true ]] && echo "Model: ${MODEL}" && echo ""
+
+    for node in "${TARGET_NODES[@]}"; do
+        role="$(node_role "$node")"
+
+        # Attempt cache check
+        raw=""
+        node_reachable=true
+        if raw=$(check_node_cache "$node" 2>/dev/null) && [[ -n "$raw" ]]; then
+            IFS='|' read -r status total_files inc_files size cache_path <<< "$raw"
+        else
+            status="UNREACHABLE"
+            total_files=0
+            inc_files=0
+            size="0"
+            cache_path="unknown"
+            node_reachable=false
+        fi
+
+        if [[ "$status" == "COMPLETE" ]]; then
+            complete_count=$(( complete_count + 1 ))
+        else
+            all_complete=false
+        fi
+
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            [[ -n "$json_nodes" ]] && json_nodes="${json_nodes},"
+            json_nodes="${json_nodes}{\"host\":\"${node}\",\"role\":\"${role}\",\"status\":\"${status}\",\"cache_path\":\"${cache_path}\",\"total_files\":${total_files},\"incomplete_files\":${inc_files},\"size\":\"${size}\"}"
+        else
+            echo "--- ${node} (${role}) ---"
+            case "$status" in
+                COMPLETE)     _green  "  Status:     COMPLETE" ;;
+                IN_PROGRESS)  _yellow "  Status:     IN_PROGRESS" ;;
+                NOT_FOUND)    echo    "  Status:     NOT_FOUND" ;;
+                UNREACHABLE)  _red    "  Status:     UNREACHABLE (SSH failed)" ;;
+                *)            echo    "  Status:     ${status}" ;;
+            esac
+            echo "  Cache:      ${cache_path}"
+            [[ "$status" != "UNREACHABLE" && "$status" != "NOT_FOUND" ]] && \
+                echo "  Files:      ${total_files} total, ${inc_files} incomplete"
+            [[ "$status" != "UNREACHABLE" && "$status" != "NOT_FOUND" ]] && \
+                echo "  Size:       ${size}"
+
+            # Show log tail hint if in progress
+            if [[ "$status" == "IN_PROGRESS" ]]; then
+                echo ""
+                if is_local "$node"; then
+                    echo "  Log: tail -f ${LOG_FILE}"
+                else
+                    echo "  Log: ssh ${node} tail -f ${LOG_FILE}"
+                fi
+            fi
+            echo ""
+        fi
+    done
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        ready="false"
+        [[ "$all_complete" == true ]] && ready="true"
+        echo "{\"model\":\"${MODEL}\",\"ready\":${ready},\"nodes\":[${json_nodes}]}"
+    else
+        if [[ "$all_complete" == true ]]; then
+            _green "Ready: YES (${complete_count} of ${total_count} nodes complete)"
+        else
+            echo "Ready: NO (${complete_count} of ${total_count} nodes complete)"
+        fi
+    fi
+
+    # Exit code: 0 if all complete, 1 otherwise
+    if [[ "$all_complete" == true ]]; then exit 0; else exit 1; fi
+fi
+
+# ===========================================================================
+# DOWNLOAD MODE
+# ===========================================================================
+
+# Precondition: huggingface-cli on local node
+if ! command -v huggingface-cli &>/dev/null; then
+    spark_die "huggingface-cli not found on $(hostname).
+Install it with: pip install huggingface-hub"
+fi
+
+spark_info "Downloading ${MODEL} on ${#TARGET_NODES[@]} node(s)..."
+echo ""
+
+had_error=false
+any_started=false
+
+for node in "${TARGET_NODES[@]}"; do
+    role="$(node_role "$node")"
+
+    if is_local "$node"; then
+        echo "--- ${node} (${role}, local) ---"
+
+        # Check if already complete
+        if [[ "$FORCE" != true ]]; then
+            raw=$(check_local_cache 2>/dev/null || echo "UNKNOWN|0|0|0|unknown")
+            IFS='|' read -r status _ _ _ _ <<< "$raw"
+            if [[ "$status" == "COMPLETE" ]]; then
+                _green "  Already complete — skipping (use --force to re-download)"
+                echo ""
+                continue
+            fi
+        fi
+
+        echo "  Starting background download..."
+
+        # Ensure cache parent directory exists
+        mkdir -p "${HF_HOME:-$HOME/.cache/huggingface}/hub"
+
+        # Launch download in background (survives shell exit)
+        nohup bash -c "
+            ${HF_TOKEN:+export HF_TOKEN='${HF_TOKEN}'}
+            echo \"[spark-download] started: ${MODEL} at \$(date)\" > '${LOG_FILE}'
+            huggingface-cli download '${MODEL}' >> '${LOG_FILE}' 2>&1
+            echo \"[spark-download] finished at \$(date) (exit: \$?)\" >> '${LOG_FILE}'
+        " </dev/null >/dev/null 2>&1 &
+        local dl_pid=$!
+
+        echo "  Log: ${LOG_FILE}"
+        _green "  Download started (PID ${dl_pid})"
+        any_started=true
+
+    else
+        echo "--- ${node} (${role}, via ssh) ---"
+
+        # Check if already complete on remote
+        if [[ "$FORCE" != true ]]; then
+            raw=$(check_remote_cache "$node" 2>/dev/null || echo "UNKNOWN|0|0|0|unknown")
+            IFS='|' read -r status _ _ _ _ <<< "$raw"
+            if [[ "$status" == "COMPLETE" ]]; then
+                _green "  Already complete — skipping (use --force to re-download)"
+                echo ""
+                continue
+            fi
+        fi
+
+        # Check huggingface-cli on remote node
+        if ! spark_ssh "$node" "command -v huggingface-cli" &>/dev/null; then
+            spark_warn "huggingface-cli not found on ${node}."
+            _yellow "  Install: ssh ${node} pip install huggingface-hub"
+            echo ""
+            had_error=true
+            continue
+        fi
+
+        echo "  Starting background download..."
+
+        # Build remote command — HF_TOKEN forwarded only if set locally
+        local token_export=""
+        [[ -n "${HF_TOKEN:-}" ]] && token_export="export HF_TOKEN='${HF_TOKEN}'; "
+
+        spark_ssh "$node" "${token_export}nohup bash -c '
+            echo \"[spark-download] started: ${MODEL} at \$(date)\" > \"${LOG_FILE}\"
+            huggingface-cli download \"${MODEL}\" >> \"${LOG_FILE}\" 2>&1
+            echo \"[spark-download] finished at \$(date) (exit: \$?)\" >> \"${LOG_FILE}\"
+        ' </dev/null >/dev/null 2>&1 &" 2>/dev/null
+
+        echo "  Log (on ${node}): ${LOG_FILE}"
+        _green "  Download started"
+        any_started=true
+    fi
+    echo ""
+done
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+if [[ "$any_started" == true ]]; then
+    echo "Poll progress with:"
+    echo "  spark-download --status ${MODEL}"
+    echo ""
+    echo "When ready, switch to this model:"
+    echo "  spark-set-model ${MODEL}"
+    if [[ "$(spark_read_topology)" != "split" ]]; then
+        echo "  spark-stop && spark-serve"
+    fi
+else
+    if [[ "$had_error" == true ]]; then
+        spark_error "Some nodes could not be reached or are missing huggingface-cli."
+        exit 1
+    else
+        echo "No downloads started (all nodes already have the model cached)."
+        echo "Use --force to re-download."
+    fi
+fi

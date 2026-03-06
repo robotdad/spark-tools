@@ -222,6 +222,8 @@ printf "  %-44s  cluster settings\n" "${SPARK_CLUSTER_ENV}"
 printf "  %-44s  model settings\n"   "${SPARK_MODEL_ENV}"
 echo ""
 _bold "--- Model operations ---"
+echo "  spark-download <repo>               # pre-stage model on all nodes"
+echo "  spark-download --status [repo]      # check download progress"
 echo "  spark-set-model <repo>              # change model"
 echo "  spark-set-model <repo> --tp 1       # with TP override"
 echo "  spark-set-model <repo> --ctx 131072 # with context length"
@@ -266,6 +268,17 @@ spark-mode [COMMAND] [--engine ENGINE]
   --engine ENGINE  Also switch inference engine (trtllm or vllm)
   Applies to: all modes.
   Run: spark-mode --help
+
+spark-download <model> [--force] [--node HOSTNAME]
+spark-download --status [model] [--json] [--node HOSTNAME]
+  Pre-stage model weights on all cluster nodes (background download).
+  Downloads run in the background and survive SSH disconnects.
+  Use --status to poll progress; --json for machine-readable output.
+  --force           Re-download even if cache already exists
+  --node HOSTNAME   Target a single node only
+  --json            JSON output with --status (exit 0 if all COMPLETE, 1 otherwise)
+  Applies to: all modes and topologies.
+  Run: spark-download --help
 
 spark-set-model <model> [--tp N] [--ctx N] [--mem N] [--served NAME] [--skip-preflight]
   Change the active model in model.env.
@@ -351,6 +364,14 @@ OPERATIONAL WORKFLOWS
   spark-serve                             # start with current mode/engine from config
   sudo spark-mode split                   # switch topology + auto-start (best performance)
   sudo spark-mode cluster                 # switch topology + auto-start (Ray TP=2)
+
+--- To pre-stage a model (download while current model is still serving) ---
+  spark-download <repo>                   # background download on all nodes
+  spark-download --status <repo>          # poll progress
+  spark-download --status <repo> --json   # machine-readable progress (for agents)
+  # When ready:
+  spark-set-model <repo>
+  spark-stop && spark-serve               # (ray/swarm only; split auto-restarts)
 
 --- To switch models ---
   spark-set-model <repo>                  # split: syncs to ${SPARK_SECONDARY_HOST} + restarts both automatically
