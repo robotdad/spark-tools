@@ -359,7 +359,7 @@ if [[ "$SPARK_MODE" == "split" ]]; then
 
     # Convert HuggingFace repo ID to HF hub cache directory name.
     # e.g.  "Qwen/Qwen3-Coder-Next-FP8" → "models--Qwen--Qwen3-Coder-Next-FP8"
-    MODEL_CACHE_DIR="models--$(echo "$NEW_MODEL" | tr '/' '--')"
+    MODEL_CACHE_DIR="models--${NEW_MODEL//\//--}"
     REMOTE_HF_HUB="${HF_HOME:-$HOME/.cache/huggingface}/hub"
 
     CACHE_FOUND=false
