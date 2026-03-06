@@ -61,7 +61,7 @@ if [[ -n "${MODEL_NAME:-}" ]]; then
         "${TP_SIZE:-?}" "${MAX_MODEL_LEN:-?}" "${GPU_MEM_UTIL:-?}"
 fi
 printf "  API:       http://localhost:%s/v1\n" "${PORT}"
-[[ "$SPARK_MODE" == "split" ]] && \
+[[ "$TOPOLOGY" == "split" ]] && \
     printf "  Proxy LB:  http://localhost:%s/v1\n" "${PROXY_PORT}"
 _bold "$SEP"
 
@@ -72,16 +72,16 @@ _bold "$SEP"
 # ---------------------------------------------------------------------------
 # SPLIT MODE
 # ---------------------------------------------------------------------------
-if [[ "$SPARK_MODE" == "split" ]]; then
+if [[ "$TOPOLOGY" == "split" ]]; then
 
     echo ""
     _bold "--- Split Mode: ${SPARK_PRIMARY_HOST} (head) ---"
-    echo "  systemctl status vllm-standalone    # vLLM instance (this node)"
-    echo "  systemctl status vllm-proxy         # load balancer / router"
+    echo "  systemctl status spark-vllm-standalone    # vLLM instance (this node)"
+    echo "  systemctl status spark-proxy              # load balancer / router"
     echo "  systemctl status open-webui"
     echo ""
     _bold "--- Split Mode: ${SPARK_SECONDARY_HOST} (worker) ---"
-    echo "  ssh ${SPARK_SECONDARY_HOST} systemctl status vllm-standalone"
+    echo "  ssh ${SPARK_SECONDARY_HOST} systemctl status spark-vllm-standalone"
     echo ""
     _bold "--- Switching models (split mode) ---"
     echo "  spark-set-model <repo>              # updates config, syncs to"
@@ -89,9 +89,9 @@ if [[ "$SPARK_MODE" == "split" ]]; then
     echo "  spark-set-model <repo> --tp 1 --ctx 131072"
     echo ""
     _bold "--- Logs ---"
-    echo "  journalctl -u vllm-standalone -f              # ${SPARK_PRIMARY_HOST}"
-    echo "  journalctl -u vllm-proxy -f"
-    echo "  ssh ${SPARK_SECONDARY_HOST} journalctl -u vllm-standalone -f"
+    echo "  journalctl -u spark-vllm-standalone -f              # ${SPARK_PRIMARY_HOST}"
+    echo "  journalctl -u spark-proxy -f"
+    echo "  ssh ${SPARK_SECONDARY_HOST} journalctl -u spark-vllm-standalone -f"
     echo ""
     _bold "--- Health checks ---"
     echo "  spark-check"
@@ -105,9 +105,9 @@ if [[ "$SPARK_MODE" == "split" ]]; then
     echo "  spark-mode swarm                    # Docker Swarm + MPI"
 
 # ---------------------------------------------------------------------------
-# RAY MODE
+# CLUSTER (RAY) MODE
 # ---------------------------------------------------------------------------
-elif [[ "$SPARK_MODE" == "ray" ]]; then
+elif [[ "$TOPOLOGY" == "cluster" ]]; then
 
     echo ""
     _bold "--- Ray Mode: ${SPARK_PRIMARY_HOST} (head) ---"
@@ -205,7 +205,7 @@ _bold "$SEP"
 # SECTIONS 4-8: Plain text reference (no ANSI — clean for agent parsing)
 # ===========================================================================
 
-cat <<'CMDREF'
+cat <<CMDREF
 
 ================================================================
 COMMAND REFERENCE
@@ -216,7 +216,7 @@ key flags, and which modes each command applies to.
 spark-init [--force]
   Initialize config files (cluster.env + model.env) in ~/.config/spark-tools/
   Auto-detects hostname, QSFP interface, and secondary node.
-  --force overwrites existing config. Run once on the head node (monad).
+  --force overwrites existing config. Run once on the head node (${SPARK_PRIMARY_HOST}).
   Applies to: initial setup.
   Run: spark-init --help
 
@@ -236,7 +236,7 @@ spark-mode [COMMAND] [--engine ENGINE]
 
 spark-set-model <model> [--tp N] [--ctx N] [--mem N] [--served NAME] [--skip-preflight]
   Change the active model in model.env.
-  Split mode: verifies dyad model cache, syncs model.env, restarts both nodes.
+  Split mode: verifies ${SPARK_SECONDARY_HOST} model cache, syncs model.env, restarts both nodes.
   Ray/swarm: config-only update -- apply with: spark-stop && spark-serve
   --tp N            Tensor-parallel degree (split mode default: 1)
   --ctx N           Max context length in tokens
@@ -249,7 +249,7 @@ spark-set-model <model> [--tp N] [--ctx N] [--mem N] [--served NAME] [--skip-pre
 spark-serve [model]
   Start inference services using the current mode and engine from config.
   Optional positional arg overrides MODEL_NAME for this invocation only.
-  Dispatches to backends/{SPARK_MODE}/serve.sh.
+  Dispatches to backends/{\$SPARK_MODE}/serve.sh.
   Applies to: all modes.
   Run: spark-serve --help
 
@@ -300,7 +300,7 @@ spark-help
   This reference. No args = full reference. --help = brief meta-description.
 CMDREF
 
-cat <<'WORKFLOWS'
+cat <<WORKFLOWS
 
 ================================================================
 OPERATIONAL WORKFLOWS
@@ -320,7 +320,7 @@ OPERATIONAL WORKFLOWS
   sudo spark-mode cluster                 # switch topology + auto-start (Ray TP=2)
 
 --- To switch models ---
-  spark-set-model <repo>                  # split: syncs to dyad + restarts both automatically
+  spark-set-model <repo>                  # split: syncs to ${SPARK_SECONDARY_HOST} + restarts both automatically
   spark-set-model <repo> --tp 1 --ctx 131072   # with explicit parallelism + context
   # After model change in ray/swarm mode (config-only), apply it:
   spark-stop && spark-serve
@@ -341,8 +341,8 @@ OPERATIONAL WORKFLOWS
   spark-bench 5 512                       # 5 runs, 512 tokens
 
 --- To view logs ---
-  journalctl -u spark-vllm-standalone -f            # split mode, monad
-  ssh dyad journalctl -u spark-vllm-standalone -f   # split mode, dyad
+  journalctl -u spark-vllm-standalone -f            # split mode, ${SPARK_PRIMARY_HOST}
+  ssh ${SPARK_SECONDARY_HOST} journalctl -u spark-vllm-standalone -f   # split mode, ${SPARK_SECONDARY_HOST}
   journalctl -u spark-ray-vllm -f                   # cluster (ray) mode
   docker service logs spark_vllm -f                 # swarm mode
   journalctl -u spark-proxy -f                      # auth proxy (all modes)
@@ -361,15 +361,15 @@ Load order — later files override earlier values for the same variable:
   1. cluster.env          Orchestration: mode, engine, hosts, ports, Docker images
   2. model.env            Model: name, TP size, context length, GPU memory, extra args
   3. node.env             Generic per-node override (optional; applied on any node)
-  4. node.env.<hostname>  Host-specific override  e.g. node.env.monad, node.env.dyad
+  4. node.env.<hostname>  Host-specific override  e.g. node.env.${SPARK_PRIMARY_HOST}, node.env.${SPARK_SECONDARY_HOST}
 
   System-level overrides also load from /etc/spark-tools/node.env (lowest priority).
 
 Key variables in cluster.env:
   SPARK_MODE            swarm | ray  (orchestration backend; topology stored separately)
   SPARK_ENGINE          trtllm | vllm
-  SPARK_PRIMARY_HOST    head node hostname  (default: monad)
-  SPARK_SECONDARY_HOST  worker node hostname  (default: dyad)
+  SPARK_PRIMARY_HOST    head node hostname  (default: ${SPARK_PRIMARY_HOST})
+  SPARK_SECONDARY_HOST  worker node hostname  (default: ${SPARK_SECONDARY_HOST})
   SPARK_QSFP_IFACE      inter-node GPU traffic interface  (default: enp1s0f0np0)
   SPARK_PORT            vLLM API port  (default: 8000)
   SPARK_PROXY_PORT      auth proxy port  (default: 9000)
@@ -385,9 +385,9 @@ Key variables in model.env:
   TRTLLM_PORT           TRT-LLM listen port  (default: 8355)
   TRTLLM_MAX_BATCH_SIZE TRT-LLM max batch size
 
-node.env.monad / node.env.dyad — split mode per-node tuning:
+node.env.${SPARK_PRIMARY_HOST} / node.env.${SPARK_SECONDARY_HOST} — split mode per-node tuning:
   Override GPU_MEM_UTIL, MAX_MODEL_LEN, VLLM_EXTRA_ARGS per node.
-  dyad can use higher GPU_MEM_UTIL since it hosts fewer services.
+  ${SPARK_SECONDARY_HOST} can use higher GPU_MEM_UTIL since it hosts fewer services.
   These files are synced to each node by 'sudo spark-mode split' and
   'spark-set-model' (split mode).
 
@@ -399,7 +399,7 @@ Topology state file (separate from SPARK_MODE):
 Config is created by: spark-init  (or ./install.sh on first run)
 CONFHIER
 
-cat <<'MODES'
+cat <<MODES
 
 ================================================================
 OPERATING MODES
@@ -408,15 +408,15 @@ OPERATING MODES
 SPLIT  (topology: split)
   Each node runs a completely independent vLLM instance at TP=1. No Ray,
   no MPI, no inter-node GPU communication during inference. The auth proxy
-  on monad load-balances requests across both nodes.
+  on ${SPARK_PRIMARY_HOST} load-balances requests across both nodes.
   Activate:   sudo spark-mode split
-  Requires:   Model cached on dyad; model must fit in a single GB10 GPU.
-  API:        http://monad:8000/v1  (direct) or http://monad:9000/v1  (proxy LB)
-  Services:   spark-vllm-standalone on each node, spark-proxy on monad
+  Requires:   Model cached on ${SPARK_SECONDARY_HOST}; model must fit in a single GB10 GPU.
+  API:        http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1  (direct) or http://${SPARK_PRIMARY_HOST}:${SPARK_PROXY_PORT:-9000}/v1  (proxy LB)
+  Services:   spark-vllm-standalone on each node, spark-proxy on ${SPARK_PRIMARY_HOST}
   Strengths:
     - CUDA graphs enabled at TP=1 (no --enforce-eager needed)
     - Best latency and throughput: ~45 tok/s, ~0.3s first-token latency
-    - Per-node tuning via node.env.monad / node.env.dyad
+    - Per-node tuning via node.env.${SPARK_PRIMARY_HOST} / node.env.${SPARK_SECONDARY_HOST}
     - Each node can independently serve a different model
     - FP8 KV cache, FlashInfer, prefix caching all work correctly
   Weakness:   Model size limited to single-GPU VRAM (~119 GB on GB10)
@@ -429,8 +429,8 @@ CLUSTER  (topology: cluster, orchestration: ray)
   Activate:   sudo spark-mode cluster  (installs units + starts Ray + vLLM)
               -- or: spark-mode ray  (config only), then spark-serve
   Requires:   SPARK_ENGINE=vllm  (ray + trtllm is unsupported and will error)
-  API:        http://monad:8000/v1
-  Services:   spark-ray-head + spark-ray-vllm on monad, spark-ray-worker on dyad
+  API:        http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1
+  Services:   spark-ray-head + spark-ray-vllm on ${SPARK_PRIMARY_HOST}, spark-ray-worker on ${SPARK_SECONDARY_HOST}
   Strengths:  Unified model weights across both GPUs; supports models that
               exceed single-GPU VRAM; single API endpoint
   Weakness:   --enforce-eager is required on GB10 at TP=2 to avoid a Triton
@@ -445,8 +445,8 @@ SWARM  (orchestration: swarm)
   (functionally similar to split, but lifecycle managed by Swarm).
   Activate:   spark-mode swarm [--engine trtllm|vllm]  (then spark-serve)
   Required:   SPARK_ENGINE=trtllm requires swarm mode (only supported combo)
-  API (trtllm): http://monad:8355/v1
-  API (vllm):   http://monad:8000/v1
+  API (trtllm): http://${SPARK_PRIMARY_HOST}:${TRTLLM_PORT:-8355}/v1
+  API (vllm):   http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1
   Services:   spark-swarm-stack manages the Docker stack across both nodes
   Strengths:  Highest batch throughput with TRT-LLM; production-grade
               container lifecycle management
@@ -460,8 +460,8 @@ Valid mode + engine combinations:
   ray   + trtllm   NOT SUPPORTED -- spark-serve will error at startup
 
 Hardware:
-  monad  DGX Spark  GB10 GPU  head node: API server, proxy, WebUI
-  dyad   DGX Spark  GB10 GPU  worker node: dedicated compute
+  ${SPARK_PRIMARY_HOST}  DGX Spark  GB10 GPU  head node: API server, proxy, WebUI
+  ${SPARK_SECONDARY_HOST}   DGX Spark  GB10 GPU  worker node: dedicated compute
   QSFP   200 Gb/s direct link, link-local 169.254.x.x (no DHCP required)
          Carries: NCCL all-reduce (Ray/vLLM) and MPI collectives (TRT-LLM)
 MODES
@@ -477,9 +477,9 @@ OpenAI chat completions protocol can connect — Amplifier, curl, Python
 openai library, etc.
 
 Endpoints:
-  Direct (no auth):  http://monad:${SPARK_PORT:-8000}/v1
-                     http://dyad:${SPARK_PORT:-8000}/v1
-  Via proxy (auth):  http://monad:9000/v1
+  Direct (no auth):  http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1
+                     http://${SPARK_SECONDARY_HOST}:${SPARK_PORT:-8000}/v1
+  Via proxy (auth):  http://${SPARK_PRIMARY_HOST}:${SPARK_PROXY_PORT:-9000}/v1
 
 The proxy load-balances across both nodes and requires a bearer token.
 The token lives in: ~/.config/vllm-proxy/secret.env
@@ -496,7 +496,7 @@ Add to your bundle or profile YAML:
   providers:
     - module: provider-vllm
       config:
-        base_url: http://monad:9000/v1      # proxy (recommended)
+        base_url: http://${SPARK_PRIMARY_HOST}:${SPARK_PROXY_PORT:-9000}/v1      # proxy (recommended)
         api_key: <token from secret.env>     # required when using proxy
         model: ${SERVED_MODEL_NAME:-$MODEL_NAME}
 
@@ -505,13 +505,13 @@ Or without the proxy (direct to one node, no auth):
   providers:
     - module: provider-vllm
       config:
-        base_url: http://monad:${SPARK_PORT:-8000}/v1
+        base_url: http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1
         api_key: none
         model: ${SERVED_MODEL_NAME:-$MODEL_NAME}
 
 --- curl ---
 
-  curl http://monad:${SPARK_PORT:-8000}/v1/chat/completions \\
+  curl http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1/chat/completions \\
     -H "Content-Type: application/json" \\
     -d '{
       "model": "${SERVED_MODEL_NAME:-$MODEL_NAME}",
@@ -520,7 +520,7 @@ Or without the proxy (direct to one node, no auth):
     }'
 
   # Via proxy (add auth header):
-  curl http://monad:9000/v1/chat/completions \\
+  curl http://${SPARK_PRIMARY_HOST}:${SPARK_PROXY_PORT:-9000}/v1/chat/completions \\
     -H "Content-Type: application/json" \\
     -H "Authorization: Bearer <token>" \\
     -d '{ ... }'
@@ -529,8 +529,8 @@ Or without the proxy (direct to one node, no auth):
 
   from openai import OpenAI
   client = OpenAI(
-      base_url="http://monad:${SPARK_PORT:-8000}/v1",
-      api_key="none",       # direct; use token for proxy on :9000
+      base_url="http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1",
+      api_key="none",       # direct; use token for proxy on :${SPARK_PROXY_PORT:-9000}
   )
   r = client.chat.completions.create(
       model="${SERVED_MODEL_NAME:-$MODEL_NAME}",
@@ -540,13 +540,13 @@ Or without the proxy (direct to one node, no auth):
 
 --- Verify connectivity ---
 
-  curl -s http://monad:${SPARK_PORT:-8000}/v1/models | python3 -m json.tool
-  curl -s http://dyad:${SPARK_PORT:-8000}/v1/models  | python3 -m json.tool
-  curl -s -H "Authorization: Bearer <token>" http://monad:9000/v1/models
+  curl -s http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/v1/models | python3 -m json.tool
+  curl -s http://${SPARK_SECONDARY_HOST}:${SPARK_PORT:-8000}/v1/models  | python3 -m json.tool
+  curl -s -H "Authorization: Bearer <token>" http://${SPARK_PRIMARY_HOST}:${SPARK_PROXY_PORT:-9000}/v1/models
 
 CONNECT
 
-cat <<'TROUBLESHOOT'
+cat <<TROUBLESHOOT
 
 ================================================================
 TROUBLESHOOTING QUICK REFERENCE
@@ -569,13 +569,13 @@ High latency / low throughput        In split mode: verify --enforce-eager is NO
                                      journalctl -u spark-vllm-standalone | grep -i eager
                                      Check FlashInfer: grep -i flashinfer (same log)
 
-Ray worker not joining cluster       ssh dyad systemctl status spark-ray-worker
+Ray worker not joining cluster       ssh ${SPARK_SECONDARY_HOST} systemctl status spark-ray-worker
                                      Verify: docker exec spark-ray ray status
-                                     Expect 2 nodes; check HEAD_IP in cluster.env on dyad
+                                     Expect 2 nodes; check HEAD_IP in cluster.env on ${SPARK_SECONDARY_HOST}
 
 503 All backends down (proxy)        spark-check
-                                     curl http://monad:8000/health
-                                     curl http://dyad:8000/health
+                                     curl http://${SPARK_PRIMARY_HOST}:${SPARK_PORT:-8000}/health
+                                     curl http://${SPARK_SECONDARY_HOST}:${SPARK_PORT:-8000}/health
                                      systemctl cat spark-proxy | grep VLLM_BACKENDS
 
 401 Unauthorized (proxy)             cat ~/.config/vllm-proxy/secret.env
@@ -586,9 +586,9 @@ Ray worker not joining cluster       ssh dyad systemctl status spark-ray-worker
                                      Check SERVED_MODEL_NAME alias in model.env
                                      Use exact model ID shown by /v1/models
 
-SSH to dyad fails                    ssh-copy-id dyad
-                                     ssh-keyscan dyad >> ~/.ssh/known_hosts
-                                     getent hosts dyad  (verify /etc/hosts entry)
+SSH to ${SPARK_SECONDARY_HOST} fails                    ssh-copy-id ${SPARK_SECONDARY_HOST}
+                                     ssh-keyscan ${SPARK_SECONDARY_HOST} >> ~/.ssh/known_hosts
+                                     getent hosts ${SPARK_SECONDARY_HOST}  (verify /etc/hosts entry)
 
 QSFP interface down or missing       ip link show enp1s0f0np0
                                      sudo ip link set enp1s0f0np0 up
@@ -603,16 +603,16 @@ Stale Docker container conflict      docker rm -f node
 Docker image not found               docker pull <image>  -- on BOTH nodes
                                      docker images | grep -E 'vllm|trtllm'
 
-Swarm not initialized                docker swarm init --advertise-addr <MONAD_IP>  (monad)
-                                     docker swarm join --token <TOKEN> <IP>:2377   (dyad)
+Swarm not initialized                docker swarm init --advertise-addr <MONAD_IP>  (${SPARK_PRIMARY_HOST})
+                                     docker swarm join --token <TOKEN> <IP>:2377   (${SPARK_SECONDARY_HOST})
                                      docker node ls  (verify both nodes visible)
 
 LAN IP changed after router swap     cd ~/spark-tools
                                      ./install.sh --head-ip <NEW_IP> --worker-ip <NEW_IP>
 
 Missing tiktoken vocab files         sudo cp ~/spark-tools/encodings/*.tiktoken /etc/encodings/
-  (GPT-OSS model HarmonyError)       ssh dyad sudo mkdir -p /etc/encodings
-                                     ssh dyad sudo cp ...  (repeat on dyad)
+  (GPT-OSS model HarmonyError)       ssh ${SPARK_SECONDARY_HOST} sudo mkdir -p /etc/encodings
+                                     ssh ${SPARK_SECONDARY_HOST} sudo cp ...  (repeat on ${SPARK_SECONDARY_HOST})
 
 Service unit files out of sync       cd ~/spark-tools && ./install.sh --force
   (after IP/username change)         sudo systemctl daemon-reload
@@ -621,3 +621,39 @@ Full cluster reset                   spark-reset  (stop + 5s wait + serve)
                                      Manual: spark-stop; sleep 5; spark-serve
 ================================================================
 TROUBLESHOOT
+
+# ===========================================================================
+# FINAL SECTION: Quick connect (always last — visible without scrolling up)
+# ===========================================================================
+echo ""
+_bold "$SEP"
+_bold " Quick Connect"
+echo ""
+
+_MODEL="${SERVED_MODEL_NAME:-${MODEL_NAME:-not configured}}"
+_TOKEN=""
+_SECRET_FILE="${HOME}/.config/vllm-proxy/secret.env"
+if [[ -f "${_SECRET_FILE}" ]]; then
+    _TOKEN="$(grep '^VLLM_PROXY_SECRET=' "${_SECRET_FILE}" 2>/dev/null | cut -d= -f2 | tr -d \"\')"
+fi
+
+printf "  Model:     %s\n" "${_MODEL}"
+echo ""
+echo "  Endpoints:"
+printf "    Load balanced:  http://%s:%s/v1\n" "${SPARK_PRIMARY_HOST}" "${PROXY_PORT}"
+printf "    Direct %-8s http://%s:%s/v1\n" "${SPARK_PRIMARY_HOST}:" "${SPARK_PRIMARY_HOST}" "${PORT}"
+printf "    Direct %-8s http://%s:%s/v1\n" "${SPARK_SECONDARY_HOST}:" "${SPARK_SECONDARY_HOST}" "${PORT}"
+echo ""
+if [[ -n "${_TOKEN}" ]]; then
+    echo "  API key:   ${_TOKEN}"
+    echo ""
+    echo "  Amplifier:"
+    echo "    amplifier provider add vllm \\"
+    printf "      --base-url http://%s:%s/v1 \\\\\n" "${SPARK_PRIMARY_HOST}" "${PROXY_PORT}"
+    echo "      --api-key ${_TOKEN} \\"
+    echo "      --model ${_MODEL}"
+else
+    echo "  API key:   not generated yet (run: sudo spark-mode split)"
+fi
+echo ""
+_bold "$SEP"
