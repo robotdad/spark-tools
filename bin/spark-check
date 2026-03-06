@@ -13,7 +13,27 @@ while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'SHORT'
+Usage: spark-check
+Mode-aware health check for the Spark cluster (split / ray / swarm).
+
+Checks systemd services, Docker orchestration, HTTP endpoints, GPU utilization,
+and the active model — prints a color-coded summary, exits 0 (clear) or 1 (fail).
+
+  Green ✓  passed    Yellow ~  warning    Red ✗  failure
+
+Common usage:
+  spark-check                           One-shot health check
+  until spark-check; do sleep 10; done  Poll after spark-serve until ready
+  spark-reset && spark-check            Recover then verify
+
+Run 'spark-check --help' for full details.
+SHORT
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 spark-check — Mode-aware health check for the Spark cluster
 
@@ -126,6 +146,9 @@ See also:
   spark-reset      Stop + restart cycle
   spark-help       Comprehensive quick reference for all spark-tools commands
 EOF
+
+    echo ""
+    echo "For short help: $(basename "$0") -h"
     exit 0
 fi
 

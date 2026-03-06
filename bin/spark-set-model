@@ -17,7 +17,25 @@ while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "-h" ]]; then
+    cat << 'SHORT'
+Usage: spark-set-model <model-name> [OPTIONS]
+Change the active model configuration (updates model.env).
+
+  --tp SIZE        Tensor parallel size (1 for split topology, 2 for cluster)
+  --ctx LENGTH     Max context length in tokens
+  --mem UTIL       GPU memory utilization fraction (0.0–1.0)
+  --served NAME    Short model alias returned by the /v1/models API
+  --skip-preflight Skip model cache check on dyad (split mode only)
+
+Split mode:  syncs config to dyad and restarts vllm-standalone on both nodes.
+Ray/Swarm:   config-only update — run 'spark-stop && spark-serve' to apply.
+
+Run 'spark-set-model --help' for full details.
+SHORT
+    exit 0
+fi
+if [[ "${1:-}" == "--help" ]]; then
     cat << 'EOF'
 spark-set-model — change the active model configuration
 
@@ -212,6 +230,8 @@ SEE ALSO
   spark-stop          Stop inference services
   spark-check         Verify the API endpoint is responding correctly
 EOF
+    echo ""
+    echo "For short help: $(basename "$0") -h"
     exit 0
 fi
 

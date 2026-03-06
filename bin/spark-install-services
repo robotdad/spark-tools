@@ -6,7 +6,26 @@ while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'EOF'
+Usage: spark-install-services [--mode MODE] [--dry-run] [--uninstall]
+
+Install systemd service units for the spark inference stack.
+
+Options:
+  --mode MODE    Orchestration mode to install units for: swarm or ray.
+                 Default: reads SPARK_MODE from cluster.env.
+  --dry-run      Preview rendered unit files without writing anything (no sudo needed).
+  --uninstall    Stop, disable, and remove all spark-* service units.
+
+Preconditions: cluster.env must exist (run 'spark-init' first); sudo required except with --dry-run.
+
+Run 'spark-install-services --help' for full details.
+EOF
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 spark-install-services — install systemd service units for the spark inference stack
 
@@ -97,6 +116,8 @@ See also:
   spark-status            verify services are healthy after startup
   spark-help              full command reference
   install.sh              unified one-shot installer (preferred for first installs)
+
+Run 'spark-install-services -h' for short help.
 EOF
     exit 0
 fi

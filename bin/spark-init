@@ -7,7 +7,24 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 SPARK_TOOLS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_DIR="${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "-h" ]]; then
+    cat << 'SHORT'
+Usage: spark-init [--force]
+Initialize spark-tools configuration (run this first on a fresh install).
+
+Creates ~/.config/spark-tools/cluster.env and model.env from example
+templates, with auto-detected hostname, QSFP interface, and secondary
+host pre-filled. Safe to re-run — existing files are skipped by default.
+
+  --force    Overwrite existing cluster.env and model.env
+
+After running: edit both config files before using any other command.
+
+Run 'spark-init --help' for full details.
+SHORT
+    exit 0
+fi
+if [[ "${1:-}" == "--help" ]]; then
     cat << EOF
 spark-init — initialize spark-tools configuration
 
@@ -197,6 +214,8 @@ SEE ALSO
   spark-serve         Start inference services once config is ready
   spark-status        Verify cluster connectivity and model health
 EOF
+    echo ""
+    echo "For short help: $(basename "$0") -h"
     exit 0
 fi
 

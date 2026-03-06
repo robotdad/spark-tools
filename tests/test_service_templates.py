@@ -46,7 +46,7 @@ ALL_TEMPLATES = [
 _PLACEHOLDERS: dict[str, dict[str, str]] = {
     PROXY_TPL: {
         "{{USERNAME}}": "testuser",
-        "{{UPSTREAM_PORT}}": "8000",
+        "{{VLLM_BACKENDS}}": "http://localhost:8000",
         "{{SPARK_TOOLS_DIR}}": "/home/testuser/spark-tools",
         "{{PROXY_PORT}}": "9000",
     },
@@ -152,7 +152,7 @@ class TestProxyTemplate:
         assert "{{PROXY_PORT}}" in content
 
     def test_upstream_port_placeholder(self, content):
-        assert "{{UPSTREAM_PORT}}" in content
+        assert "{{VLLM_BACKENDS}}" in content
 
     def test_restart_always(self, content):
         assert "Restart=always" in content

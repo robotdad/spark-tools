@@ -22,7 +22,27 @@ source "${SCRIPT_DIR}/../lib/spark-common.sh"
 #=============================================================================
 
 # ─── Help ────────────────────────────────────────────────────────────────────
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "-h" ]]; then
+    cat << 'SHORT'
+Usage: spark-mode [swarm|ray [--engine ENGINE] | split | cluster | status]
+View or switch cluster orchestration mode and deployment topology.
+
+ORCHESTRATION (config only — no services touched, no sudo needed):
+  swarm [--engine trtllm|vllm]  Switch to Docker Swarm + MPI orchestration
+  ray                           Switch to Ray orchestration (vLLM only)
+
+TOPOLOGY (live service ops):
+  sudo spark-mode split         Two independent vLLM instances, TP=1 per node
+  sudo spark-mode cluster       Ray TP=2 cluster sharded across monad + dyad
+       spark-mode status        Show current topology and live service states
+
+  (no args)                     Show current configuration
+
+Run 'spark-mode --help' for full details.
+SHORT
+    exit 0
+fi
+if [[ "${1:-}" == "--help" ]]; then
     cat << 'EOF'
 spark-mode — view or switch cluster orchestration mode and deployment topology
 
@@ -276,6 +296,8 @@ SEE ALSO
   spark-stop          Stop inference services
   spark-status        Check cluster and API endpoint health
 EOF
+    echo ""
+    echo "For short help: $(basename "$0") -h"
     exit 0
 fi
 

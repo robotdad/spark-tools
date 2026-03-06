@@ -6,7 +6,29 @@ while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'SHORT'
+Usage: spark-bench [RUNS] [MAX_TOKENS]
+Benchmark the running inference endpoint via the OpenAI-compatible API.
+
+  RUNS         Number of sequential requests to send (default: 3)
+  MAX_TOKENS   Max completion tokens per request (default: 256)
+
+Reports per-run latency (s) and throughput (tok/s), plus aggregate averages.
+Port is chosen automatically: trtllm → TRTLLM_PORT (8355), vllm → SPARK_PORT (8000).
+
+  spark-bench           Quick 3-run benchmark with defaults
+  spark-bench 10        10-run benchmark for a stable average
+  spark-bench 5 512     5 runs with longer 512-token completions
+
+The service must be running — use spark-serve or spark-check first.
+
+Run 'spark-bench --help' for full details.
+SHORT
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 spark-bench — benchmark the running inference endpoint
 
@@ -112,6 +134,9 @@ See also:
   spark-set-model change the active model
   spark-help      full command reference
 EOF
+
+    echo ""
+    echo "For short help: $(basename "$0") -h"
     exit 0
 fi
 

@@ -62,6 +62,28 @@ FORCE=false
 #-----------------------------------------------------------------------------
 # Usage
 #-----------------------------------------------------------------------------
+short_usage() {
+    cat <<'EOF'
+Usage: ./install.sh [OPTIONS]
+
+Unified spark-tools installer for a two-node DGX Spark cluster (monad + dyad).
+
+Options:
+  --node-type TYPE    Node role: head or worker (default: auto-detect from hostname).
+  --mode MODE         Orchestration backend: swarm or ray (default: swarm).
+  --head-ip IP        Head node IP on QSFP network (default: auto-detect).
+  --worker-ip IP      Worker node IP on QSFP network (default: auto-detect).
+  --qsfp-iface IFACE  High-speed inter-node interface name (default: auto-detect).
+  --user USERNAME     Username to configure services for (default: current user).
+  --force             Overwrite existing config files.
+  --dry-run           Preview all actions without making any changes (no sudo needed).
+
+Runs 8 setup phases: config files, PATH symlinks, systemd units, kernel tuning, /etc/hosts.
+
+Run './install.sh --help' for full details.
+EOF
+}
+
 usage() {
     cat <<'EOF'
 install.sh — unified spark-tools installer for a two-node DGX Spark cluster
@@ -257,6 +279,8 @@ See also:
   spark-install-extras    install MOTD and auth proxy secret
   spark-status            cluster health check
   spark-help              full command reference
+
+Run './install.sh -h' for short help.
 EOF
 }
 
@@ -297,8 +321,12 @@ while [[ $# -gt 0 ]]; do
             FORCE=true
             shift
             ;;
-        --help|-h)
+        --help)
             usage
+            exit 0
+            ;;
+        -h)
+            short_usage
             exit 0
             ;;
         *)
