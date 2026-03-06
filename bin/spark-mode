@@ -35,6 +35,7 @@ TOPOLOGY (live service ops):
   sudo spark-mode split         Two independent vLLM instances, TP=1 per node
   sudo spark-mode cluster       Ray TP=2 cluster sharded across monad + dyad
        spark-mode status        Show current topology and live service states
+  --dry-run                      Preview what would change without modifying anything
 
   (no args)                     Show current configuration
 
@@ -100,6 +101,10 @@ ORCHESTRATION COMMANDS
 
   --engine ENGINE     Also change the inference engine. Values: trtllm, vllm.
                       Without this flag, the current engine is kept unchanged.
+
+  --dry-run           Preview the intended changes without modifying cluster.env
+                      or touching any services. Works with swarm, ray, split,
+                      and cluster subcommands.
 
 TOPOLOGY COMMANDS
 =================
@@ -268,6 +273,29 @@ Activate cluster topology (live — installs services, requires sudo):
 
   Run 'spark-mode status' to verify service states.
 
+Preview a mode switch (dry-run):
+  $ spark-mode --dry-run swarm --engine trtllm
+  [dry-run] Would switch: ray+vllm → swarm+trtllm
+
+  [dry-run] Would update: /home/user/.config/spark-tools/cluster.env
+    SPARK_MODE=swarm
+    SPARK_ENGINE=trtllm
+
+    Note: TRT-LLM uses port 8355 by default
+
+    If services are running, you would need: spark-stop && spark-serve
+
+Preview a topology change (dry-run):
+  $ sudo spark-mode split --dry-run
+  [dry-run] Would switch to SPLIT mode (two independent vLLM instances, TP=1 per node)
+
+    [1/12]  Pre-flight: verify SSH to dyad
+    [2/12]  Pre-flight: check model cache on dyad
+    ...
+    [12/12] Enable + start services on both nodes; save topology
+
+    Result: monad → vLLM standalone TP=1, dyad → vLLM standalone TP=1
+
 Check live service states:
   $ spark-mode status
   Spark Topology
@@ -317,6 +345,12 @@ case "${1:-}" in
         _TOPOLOGY_FILE="${_SPARK_CFG}/topology"
         _TEMPLATE_DIR="${SPARK_TOOLS_DIR}/systemd"
         _DYAD="${SPARK_SECONDARY_HOST:-dyad}"
+
+        # Parse --dry-run for topology commands
+        _DRY_RUN=false
+        for _arg in "$@"; do
+            [[ "$_arg" == "--dry-run" ]] && _DRY_RUN=true
+        done
 
         # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -711,11 +745,55 @@ case "${1:-}" in
 
         # ── Dispatch topology command ─────────────────────────────────────────
         case "$1" in
-            split)   _do_split   ;;
-            cluster) _do_cluster ;;
+            split)
+                if [[ "$_DRY_RUN" == true ]]; then
+                    if [[ $EUID -ne 0 ]]; then
+                        echo "[dry-run] Note: split requires sudo (not checked in dry-run)"
+                    fi
+                    echo "[dry-run] Would switch to SPLIT mode (two independent vLLM instances, TP=1 per node)"
+                    echo ""
+                    echo "  [1/12]  Pre-flight: verify SSH to ${SPARK_SECONDARY_HOST}"
+                    echo "  [2/12]  Pre-flight: check model cache on ${SPARK_SECONDARY_HOST}"
+                    echo "  [3/12]  Stop cluster services on ${SPARK_PRIMARY_HOST}"
+                    echo "  [4/12]  Stop cluster services on ${SPARK_SECONDARY_HOST}"
+                    echo "  [5/12]  Remove stale containers on both nodes"
+                    echo "  [6/12]  Install spark-vllm-standalone.service on ${SPARK_PRIMARY_HOST}"
+                    echo "  [7/12]  Install node.env on ${SPARK_PRIMARY_HOST}"
+                    echo "  [8/12]  Install spark-vllm-standalone.service on ${SPARK_SECONDARY_HOST}"
+                    echo "  [9/12]  Install spark-proxy.service on ${SPARK_PRIMARY_HOST}"
+                    echo "  [10/12] Check/create proxy secret"
+                    echo "  [11/12] Sync model.env + node.env to ${SPARK_SECONDARY_HOST}"
+                    echo "  [12/12] Enable + start services on both nodes; save topology"
+                    echo ""
+                    echo "  Result: monad → vLLM standalone TP=1, dyad → vLLM standalone TP=1"
+                    exit 0
+                fi
+                _do_split
+                ;;
+            cluster)
+                if [[ "$_DRY_RUN" == true ]]; then
+                    if [[ $EUID -ne 0 ]]; then
+                        echo "[dry-run] Note: cluster requires sudo (not checked in dry-run)"
+                    fi
+                    echo "[dry-run] Would switch to CLUSTER mode (Ray TP=2 across monad + dyad)"
+                    echo ""
+                    echo "  [1/9] Stop standalone services on ${SPARK_PRIMARY_HOST}"
+                    echo "  [2/9] Stop standalone services on ${SPARK_SECONDARY_HOST}"
+                    echo "  [3/9] Remove stale containers on both nodes"
+                    echo "  [4/9] Remove per-node overrides (node.env)"
+                    echo "  [5/9] Install Ray services on ${SPARK_PRIMARY_HOST}"
+                    echo "  [6/9] Install spark-ray-worker.service on ${SPARK_SECONDARY_HOST}"
+                    echo "  [7/9] Start Ray cluster (head + worker)"
+                    echo "  [8/9] Start vLLM (Ray distributed backend)"
+                    echo "  [9/9] Restart proxy and save topology"
+                    echo ""
+                    echo "  Result: Ray head → monad, Ray worker → dyad, vLLM TP=2 distributed"
+                    exit 0
+                fi
+                _do_cluster
+                ;;
             status)  _do_status  ;;
         esac
-        exit 0
         ;;
 esac
 
@@ -734,6 +812,7 @@ fi
 # Parse arguments
 NEW_MODE=""
 NEW_ENGINE=""
+_DRY_RUN=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         swarm|ray) NEW_MODE="$1" ;;
@@ -742,6 +821,7 @@ while [[ $# -gt 0 ]]; do
             NEW_ENGINE="${1:-}"
             [[ -z "$NEW_ENGINE" ]] && spark_die "--engine requires a value (trtllm or vllm)"
             ;;
+        --dry-run) _DRY_RUN=true ;;
         *)
             spark_die "Unknown argument: $1. Use --help for usage."
             ;;
@@ -762,6 +842,25 @@ fi
 # Nothing changed
 if [[ "$NEW_MODE" == "$SPARK_MODE" && "$NEW_ENGINE" == "$SPARK_ENGINE" ]]; then
     echo "Already in ${NEW_MODE} + ${NEW_ENGINE} mode. No change."
+    exit 0
+fi
+
+if [[ "$_DRY_RUN" == true ]]; then
+    echo "[dry-run] Would switch: ${SPARK_MODE}+${SPARK_ENGINE} → ${NEW_MODE}+${NEW_ENGINE}"
+    echo ""
+    echo "[dry-run] Would update: $SPARK_CLUSTER_ENV"
+    echo "  SPARK_MODE=${NEW_MODE}"
+    echo "  SPARK_ENGINE=${NEW_ENGINE}"
+    echo ""
+    if [[ "$NEW_ENGINE" != "$SPARK_ENGINE" ]]; then
+        if [[ "$NEW_ENGINE" == "trtllm" ]]; then
+            echo "  Note: TRT-LLM uses port ${TRTLLM_PORT:-8355} by default"
+        else
+            echo "  Note: vLLM uses port ${SPARK_PORT:-8000} by default"
+        fi
+        echo ""
+    fi
+    echo "  If services are running, you would need: spark-stop && spark-serve"
     exit 0
 fi
 

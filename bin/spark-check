@@ -15,13 +15,15 @@ source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 if [[ "${1:-}" == "-h" ]]; then
     cat <<'SHORT'
-Usage: spark-check
+Usage: spark-check [--json]
 Mode-aware health check for the Spark cluster (split / ray / swarm).
 
 Checks systemd services, Docker orchestration, HTTP endpoints, GPU utilization,
 and the active model — prints a color-coded summary, exits 0 (clear) or 1 (fail).
 
   Green ✓  passed    Yellow ~  warning    Red ✗  failure
+
+  --json             Machine-readable JSON output (for agents / automation)
 
 Common usage:
   spark-check                           One-shot health check
@@ -54,7 +56,23 @@ balancer) not managed by spark-serve/spark-stop — it is checked here for
 completeness.
 
 Usage:
-  spark-check
+  spark-check [--json]
+
+Options:
+  --json    Emit a single JSON object to stdout instead of the human-readable
+            report. Suppresses all color and decorative output. The exit code
+            is still 0 (healthy) or 1 (failures detected).
+
+            JSON structure:
+              healthy        bool     true when fail count is 0
+              topology       string   "split" | "cluster"
+              mode           string   "ray" | "swarm"
+              primary        string   primary hostname
+              secondary      string   secondary hostname
+              checks         array    [{name, status, detail?}, ...]
+              gpu            array    [{index, name, memory_used_mib, ...}, ...]
+              model          object   {name, tp_size, max_model_len, served_name, serving}
+              summary        object   {pass, fail, warn, total}
 
 Preconditions:
   - ~/.config/spark-tools/cluster.env exists  (run spark-init to create it)
@@ -135,6 +153,10 @@ Examples:
     spark-reset
   fi
 
+  # Machine-readable health check (for agents / scripts)
+  spark-check --json
+  spark-check --json | python3 -c "import sys,json; r=json.load(sys.stdin); print('OK' if r['healthy'] else 'FAIL')"
+
 Exit codes:
   0   All checks passed or only warnings  (FAIL count == 0)
   1   One or more checks resulted in FAIL  (any red ✗ item in output)
@@ -152,10 +174,31 @@ EOF
     exit 0
 fi
 
+# --- JSON output mode ---
+JSON_OUTPUT=false
+if [[ "${1:-}" == "--json" ]]; then
+    JSON_OUTPUT=true
+    shift
+fi
+
 spark_load_config
 
 # Effective topology: split | cluster (from topology file, not SPARK_MODE)
 TOPOLOGY="$(spark_read_topology)"
+
+# --- JSON collection ---
+if [[ "$JSON_OUTPUT" == true ]]; then
+    _JSON_CHECKS=$(mktemp)
+    _JSON_GPU_FILE=$(mktemp)
+    trap 'rm -f "${_JSON_CHECKS:-}" "${_JSON_GPU_FILE:-}"' EXIT
+    exec 3>&1        # save real stdout
+    exec 1>/dev/null # suppress human output
+fi
+
+_json_check() {
+    [[ "$JSON_OUTPUT" != true ]] && return
+    printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >> "$_JSON_CHECKS"
+}
 
 # ---------------------------------------------------------------------------
 # Check counters
@@ -174,9 +217,11 @@ _svc_local() {
     if systemctl is-active --quiet "$service" 2>/dev/null; then
         _green "  ✓ ${label}"
         PASS=$(( PASS + 1 ))
+        _json_check "$label" "pass"
     else
         _red   "  ✗ ${label}  [DOWN]"
         FAIL=$(( FAIL + 1 ))
+        _json_check "$label" "fail" "DOWN"
     fi
 }
 
@@ -186,9 +231,11 @@ _svc_remote() {
     if spark_ssh "$host" "systemctl is-active --quiet ${service}" 2>/dev/null; then
         _green "  ✓ ${label}"
         PASS=$(( PASS + 1 ))
+        _json_check "$label" "pass"
     else
         _red   "  ✗ ${label}  [DOWN or unreachable]"
         FAIL=$(( FAIL + 1 ))
+        _json_check "$label" "fail" "DOWN or unreachable"
     fi
 }
 
@@ -200,12 +247,15 @@ _http() {
     if [[ "$code" == "200" ]]; then
         _green  "  ✓ ${label}  [HTTP 200]"
         PASS=$(( PASS + 1 ))
+        _json_check "$label" "pass" "HTTP 200"
     elif [[ "$code" == "000" ]]; then
         _red    "  ✗ ${label}  [no response]"
         FAIL=$(( FAIL + 1 ))
+        _json_check "$label" "fail" "no response"
     else
         _yellow "  ~ ${label}  [HTTP ${code}]"
         WARN=$(( WARN + 1 ))
+        _json_check "$label" "warn" "HTTP ${code}"
     fi
 }
 
@@ -215,10 +265,12 @@ _ssh_reachable() {
     if spark_ssh "$host" "true" 2>/dev/null; then
         _green  "  ✓ SSH reachable: ${host}"
         PASS=$(( PASS + 1 ))
+        _json_check "SSH reachable: ${host}" "pass"
         return 0
     else
         _red    "  ✗ SSH unreachable: ${host}"
         FAIL=$(( FAIL + 1 ))
+        _json_check "SSH reachable: ${host}" "fail" "unreachable"
         return 1
     fi
 }
@@ -271,9 +323,11 @@ if [[ "$TOPOLOGY" == "split" ]]; then
             2>/dev/null || echo "?")
         _green "  ✓ Proxy model registry: ${LB_COUNT} model(s) registered"
         PASS=$(( PASS + 1 ))
+        _json_check "Proxy model registry" "pass" "${LB_COUNT} model(s) registered"
     else
         _yellow "  ~ Proxy model registry: unavailable"
         WARN=$(( WARN + 1 ))
+        _json_check "Proxy model registry" "warn" "unavailable"
     fi
 
 # ---------------------------------------------------------------------------
@@ -308,6 +362,7 @@ elif [[ "$TOPOLOGY" == "cluster" ]]; then
             | grep -c "node_" 2>/dev/null || echo "0")
         _green "  ✓ Ray container '${RAY_CONTAINER}' running  (${RAY_NODES} node(s) reported)"
         PASS=$(( PASS + 1 ))
+        _json_check "Ray container '${RAY_CONTAINER}'" "pass" "${RAY_NODES} node(s) reported"
         docker exec "$RAY_CONTAINER" ray status 2>/dev/null \
             | grep -E "(Active|Pending|alive|dead)" \
             | head -8 \
@@ -315,6 +370,7 @@ elif [[ "$TOPOLOGY" == "cluster" ]]; then
     else
         _yellow "  ~ Ray container '${RAY_CONTAINER}' not found"
         WARN=$(( WARN + 1 ))
+        _json_check "Ray container '${RAY_CONTAINER}'" "warn" "not found"
     fi
     echo ""
 
@@ -342,11 +398,13 @@ elif [[ "$SPARK_MODE" == "swarm" ]]; then
     if [[ "$SWARM_STATE" == "active" ]]; then
         _green "  ✓ Swarm active"
         PASS=$(( PASS + 1 ))
+        _json_check "Docker Swarm" "pass" "active"
         docker node ls --format "    {{.Hostname}}: {{.Status}} ({{.Availability}})" \
             2>/dev/null || true
     else
         _red "  ✗ Swarm not active  [state: ${SWARM_STATE}]"
         FAIL=$(( FAIL + 1 ))
+        _json_check "Docker Swarm" "fail" "state: ${SWARM_STATE}"
     fi
     echo ""
 
@@ -355,12 +413,14 @@ elif [[ "$SPARK_MODE" == "swarm" ]]; then
     if docker stack ls 2>/dev/null | grep -q "^spark"; then
         _green "  ✓ Stack 'spark' deployed"
         PASS=$(( PASS + 1 ))
+        _json_check "Docker Stack: spark" "pass" "deployed"
         docker stack services spark \
             --format "    {{.Name}}: {{.Replicas}} replicas  [{{.Image}}]" \
             2>/dev/null | head -10 || true
     else
         _yellow "  ~ Stack 'spark' not found"
         WARN=$(( WARN + 1 ))
+        _json_check "Docker Stack: spark" "warn" "not found"
     fi
     echo ""
 
@@ -382,14 +442,18 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 _bold "--- GPU (${SPARK_PRIMARY_HOST}) ---"
+_JSON_GPU_CSV=""
 if command -v nvidia-smi &>/dev/null; then
-    nvidia-smi \
+    _GPU_RAW=$(nvidia-smi \
         --query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu \
-        --format=csv,noheader,nounits 2>/dev/null \
-        | awk -F', ' '{
+        --format=csv,noheader,nounits 2>/dev/null || true)
+    if [[ -n "$_GPU_RAW" ]]; then
+        _JSON_GPU_CSV="$_GPU_RAW"
+        echo "$_GPU_RAW" | awk -F', ' '{
             printf "  GPU %s: %s  mem=%s/%s MiB  util=%s%%  temp=%s°C\n",
                 $1, $2, $3, $4, $5, $6
         }' || true
+    fi
 else
     _yellow "  ~ nvidia-smi not available"
     WARN=$(( WARN + 1 ))
@@ -398,6 +462,7 @@ fi
 # ---------------------------------------------------------------------------
 # Common: Active model
 # ---------------------------------------------------------------------------
+SERVING_ID=""
 echo ""
 _bold "--- Active Model ---"
 if [[ -n "${MODEL_NAME:-}" ]]; then
@@ -418,6 +483,94 @@ else
     _yellow "  ~ No model configured"
     _yellow "    Check: ${SPARK_MODEL_ENV}"
     WARN=$(( WARN + 1 ))
+fi
+
+# --- JSON output ---
+if [[ "$JSON_OUTPUT" == true ]]; then
+    exec 1>&3  # restore real stdout
+
+    # Write GPU CSV to temp file for Python
+    echo "${_JSON_GPU_CSV}" > "$_JSON_GPU_FILE"
+
+    HEALTHY=$([[ $FAIL -eq 0 ]] && echo true || echo false) \
+    _TOPOLOGY="$TOPOLOGY" \
+    _SPARK_MODE="$SPARK_MODE" \
+    _PRIMARY="$SPARK_PRIMARY_HOST" \
+    _SECONDARY="$SPARK_SECONDARY_HOST" \
+    _MODEL_NAME="${MODEL_NAME:-}" \
+    _TP_SIZE="${TP_SIZE:-}" \
+    _MAX_MODEL_LEN="${MAX_MODEL_LEN:-}" \
+    _SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}" \
+    _SERVING_ID="${SERVING_ID:-}" \
+    _PASS="$PASS" \
+    _FAIL="$FAIL" \
+    _WARN="$WARN" \
+    _CHECKS_FILE="$_JSON_CHECKS" \
+    _GPU_FILE="$_JSON_GPU_FILE" \
+    python3 -c '
+import json, os
+
+checks = []
+with open(os.environ["_CHECKS_FILE"]) as f:
+    for line in f:
+        parts = line.strip().split("\t")
+        if len(parts) >= 2:
+            c = {"name": parts[0], "status": parts[1]}
+            if len(parts) > 2 and parts[2]:
+                c["detail"] = parts[2]
+            checks.append(c)
+
+gpu = []
+with open(os.environ["_GPU_FILE"]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 6:
+            try:
+                gpu.append({
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "memory_used_mib": int(float(parts[2])),
+                    "memory_total_mib": int(float(parts[3])),
+                    "utilization_pct": int(float(parts[4])),
+                    "temperature_c": int(float(parts[5]))
+                })
+            except (ValueError, IndexError):
+                pass
+
+model_name = os.environ.get("_MODEL_NAME", "")
+model = {}
+if model_name:
+    model = {
+        "name": model_name,
+        "tp_size": os.environ.get("_TP_SIZE", ""),
+        "max_model_len": os.environ.get("_MAX_MODEL_LEN", ""),
+        "served_name": os.environ.get("_SERVED_MODEL_NAME", ""),
+        "serving": os.environ.get("_SERVING_ID", "")
+    }
+
+p = int(os.environ["_PASS"])
+f = int(os.environ["_FAIL"])
+w = int(os.environ["_WARN"])
+
+result = {
+    "healthy": os.environ["HEALTHY"] == "true",
+    "topology": os.environ["_TOPOLOGY"],
+    "mode": os.environ["_SPARK_MODE"],
+    "primary": os.environ["_PRIMARY"],
+    "secondary": os.environ["_SECONDARY"],
+    "checks": checks,
+    "gpu": gpu,
+    "model": model,
+    "summary": {"pass": p, "fail": f, "warn": w, "total": p + f + w}
+}
+print(json.dumps(result, indent=2))
+'
+    rm -f "$_JSON_CHECKS" "$_JSON_GPU_FILE"
+    [[ $FAIL -eq 0 ]]
+    exit
 fi
 
 # ---------------------------------------------------------------------------

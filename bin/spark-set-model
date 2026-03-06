@@ -27,6 +27,7 @@ Change the active model configuration (updates model.env).
   --mem UTIL       GPU memory utilization fraction (0.0–1.0)
   --served NAME    Short model alias returned by the /v1/models API
   --skip-preflight Skip model cache check on dyad (split mode only)
+  --dry-run        Show what would change without modifying anything
 
 Split mode:  syncs config to dyad and restarts vllm-standalone on both nodes.
 Ray/Swarm:   config-only update — run 'spark-stop && spark-serve' to apply.
@@ -130,6 +131,11 @@ OPTIONS
                       might fail (custom HF_HOME, symlinked cache, NFS mount).
                       Split mode only — has no effect in ray/swarm mode.
 
+  --dry-run           Show what would be written to model.env and what actions
+                      would follow, without modifying any files or restarting
+                      services. Use to preview the effect of a model switch.
+                      Works in all modes (split, ray, swarm).
+
 SIDE EFFECTS
 ============
   - Modifies ~/.config/spark-tools/model.env in-place (sed substitution)
@@ -194,6 +200,18 @@ Set a short client-facing model name:
 
   Restart to apply: spark-stop && spark-serve
 
+Preview a model switch without making changes:
+  $ spark-set-model nvidia/Qwen3-235B-A22B-FP4 --tp 1 --dry-run
+  [dry-run] Would update /home/user/.config/spark-tools/model.env:
+    MODEL_NAME=nvidia/Qwen3-235B-A22B-FP4
+    TP_SIZE=1
+
+  [dry-run] Split mode — would also:
+    [1/4] Check model cache on dyad
+    [2/4] Sync model.env → dyad
+    [3/4] Restart vllm-standalone on monad
+    [4/4] Restart vllm-standalone on dyad
+
 Pre-flight failure — model not downloaded on dyad (split mode):
   $ spark-set-model SomeOrg/NewModel
   Model updated in /home/user/.config/spark-tools/model.env:
@@ -251,6 +269,7 @@ NEW_MEM=""
 NEW_SERVED=""
 SET_SERVED=false
 SKIP_PREFLIGHT=false
+DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -259,6 +278,7 @@ while [[ $# -gt 0 ]]; do
         --mem)             shift; NEW_MEM="${1:-}";    [[ -z "$NEW_MEM" ]] && spark_die "--mem requires a value" ;;
         --served)          shift; NEW_SERVED="${1:-}"; SET_SERVED=true ;;
         --skip-preflight)  SKIP_PREFLIGHT=true ;;
+        --dry-run)         DRY_RUN=true ;;
         *) spark_die "Unknown option: $1. Use --help for usage." ;;
     esac
     shift
@@ -283,6 +303,28 @@ fi
 if [[ ! -f "$SPARK_MODEL_ENV" ]]; then
     spark_die "model.env not found: ${SPARK_MODEL_ENV}
 Run 'spark-init' to create it."
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo "[dry-run] Would update ${SPARK_MODEL_ENV}:"
+    echo "  MODEL_NAME=${NEW_MODEL}"
+    [[ -n "$NEW_TP" ]]          && echo "  TP_SIZE=${NEW_TP}"
+    [[ -n "$NEW_CTX" ]]         && echo "  MAX_MODEL_LEN=${NEW_CTX}"
+    [[ -n "$NEW_MEM" ]]         && echo "  GPU_MEM_UTIL=${NEW_MEM}"
+    [[ "$SET_SERVED" == true ]] && echo "  SERVED_MODEL_NAME=${NEW_SERVED}"
+    echo ""
+
+    if [[ "$SPARK_MODE" == "split" ]]; then
+        echo "[dry-run] Split mode — would also:"
+        echo "  [1/4] Check model cache on ${SPARK_SECONDARY_HOST}"
+        echo "  [2/4] Sync model.env → ${SPARK_SECONDARY_HOST}"
+        echo "  [3/4] Restart vllm-standalone on ${SPARK_PRIMARY_HOST}"
+        echo "  [4/4] Restart vllm-standalone on ${SPARK_SECONDARY_HOST}"
+    else
+        echo "[dry-run] Ray/Swarm mode — config-only update."
+        echo "  Would require: spark-stop && spark-serve"
+    fi
+    exit 0
 fi
 
 sed -i "s|^MODEL_NAME=.*|MODEL_NAME=${NEW_MODEL}|" "$SPARK_MODEL_ENV"
