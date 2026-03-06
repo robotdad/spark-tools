@@ -23,7 +23,7 @@ Port is chosen automatically: trtllm → TRTLLM_PORT (8355), vllm → SPARK_PORT
 
 The service must be running — use spark-serve or spark-check first.
 
-Run 'spark-bench --help' for full details.
+Use 'spark-bench --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

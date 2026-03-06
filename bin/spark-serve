@@ -20,7 +20,7 @@ After starting, poll readiness with: spark-check
   spark-serve                       Serve the model configured in model.env
   spark-serve nvidia/Qwen3-14B-FP4  Override model for this run only
 
-Run 'spark-serve --help' for full details.
+Use 'spark-serve --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

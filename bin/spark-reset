@@ -19,7 +19,7 @@ shows failures but services appear partially alive.
 
 After reset, poll readiness with: spark-check
 
-Run 'spark-reset --help' for full details.
+Use 'spark-reset --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

@@ -31,7 +31,7 @@ Change the active model configuration (updates model.env).
 Split mode:  syncs config to dyad and restarts vllm-standalone on both nodes.
 Ray/Swarm:   config-only update — run 'spark-stop && spark-serve' to apply.
 
-Run 'spark-set-model --help' for full details.
+Use 'spark-set-model --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

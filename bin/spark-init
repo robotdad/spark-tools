@@ -20,7 +20,7 @@ host pre-filled. Safe to re-run — existing files are skipped by default.
 
 After running: edit both config files before using any other command.
 
-Run 'spark-init --help' for full details.
+Use 'spark-init --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

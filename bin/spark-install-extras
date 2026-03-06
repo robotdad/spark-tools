@@ -20,7 +20,7 @@ Options:
 
 At least one option is required. Precondition: cluster.env must exist (run 'spark-init' first).
 
-Run 'spark-install-extras --help' for full details.
+Use 'spark-install-extras --help' for the extended reference (designed for AI agents like Amplifier).
 EOF
     exit 0
 fi

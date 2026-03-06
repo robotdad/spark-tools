@@ -19,7 +19,7 @@ Stop all running inference services on the Spark cluster.
 In ray mode no flags are accepted; all Ray and vLLM services are stopped uniformly.
 Safe to call on an idle or partially-failed cluster.
 
-Run 'spark-stop --help' for full details.
+Use 'spark-stop --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

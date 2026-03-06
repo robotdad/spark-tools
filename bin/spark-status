@@ -20,7 +20,7 @@ containers, processes, and orchestration layers.
 For a structured pass/fail summary with GPU info and live endpoint probe,
 use spark-check instead — it always produces the same output shape.
 
-Run 'spark-status --help' for full details.
+Use 'spark-status --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

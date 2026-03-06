@@ -15,23 +15,52 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "${SCRIPT_DIR}/../lib/spark-common.sh"
 
 # ---------------------------------------------------------------------------
-# -h: brief meta-description of spark-help itself (what this tool does)
+# -h: brief description + live cluster state for humans
 # ---------------------------------------------------------------------------
 if [[ "${1:-}" == "-h" ]]; then
-    cat <<'EOF'
-spark-help prints a comprehensive reference for the spark-tools cluster
-management system. Run it with no arguments to see the full reference.
+    # Load config if available — show live state or "not configured" guidance.
+    if spark_load_config 2>/dev/null; then
+        _PORT="$(spark_effective_port)"
+        _TOPO="$(cat "${SPARK_CONFIG_DIR:-$HOME/.config/spark-tools}/topology" 2>/dev/null || echo "cluster")"
+        cat <<EOF
+spark-help — Spark cluster management reference
 
-The reference includes:
-  - Current cluster state (live values from config)
-  - Full command reference for all spark-* tools with key flags
-  - Operational workflows: start serving, switch models, change topology
-  - Configuration file hierarchy and key variables
-  - Operating modes explained (split, ray, swarm) with tradeoffs
-  - Troubleshooting quick reference: symptoms and fix commands
+Cluster:
+  Primary:   ${SPARK_PRIMARY_HOST:-monad}
+  Secondary: ${SPARK_SECONDARY_HOST:-dyad}
+  Mode:      ${SPARK_MODE}   Topology: ${_TOPO}   Engine: ${SPARK_ENGINE}
+  Model:     ${MODEL_NAME:-<not set>}
+  API:       http://${SPARK_PRIMARY_HOST:-monad}:${_PORT}/v1
 
-Individual spark-* commands also support --help for per-command details.
+Quick commands:
+  spark-check          Health check
+  spark-serve          Start serving
+  spark-stop           Stop services
+  spark-set-model ID   Switch model
+  spark-mode split     Switch to independent TP=1 per node
+
+Run 'spark-help' (no args) for the full reference.
+Use 'spark-help --help' for the extended reference (designed for AI agents like Amplifier).
+Individual commands support -h (short) and --help (agent-readable).
 EOF
+    else
+        cat <<'EOF'
+spark-help — Spark cluster management reference
+
+Cluster is NOT YET CONFIGURED.
+  Run 'spark-init' to create config files, then 'spark-help' for the full reference.
+
+Quick setup:
+  1. spark-init                          Create cluster.env + model.env
+  2. spark-install-services              Install systemd units
+  3. spark-set-model <model-id>          Set the model to serve
+  4. spark-serve                         Start serving
+
+Run 'spark-help' (no args) for the full reference.
+Use 'spark-help --help' for the extended reference (designed for AI agents like Amplifier).
+Individual commands support -h (short) and --help (agent-readable).
+EOF
+    fi
     exit 0
 fi
 

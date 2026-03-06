@@ -38,7 +38,7 @@ TOPOLOGY (live service ops):
 
   (no args)                     Show current configuration
 
-Run 'spark-mode --help' for full details.
+Use 'spark-mode --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi

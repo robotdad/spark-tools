@@ -80,7 +80,7 @@ Options:
 
 Runs 8 setup phases: config files, PATH symlinks, systemd units, kernel tuning, /etc/hosts.
 
-Run './install.sh --help' for full details.
+Use './install.sh --help' for the extended reference (designed for AI agents like Amplifier).
 EOF
 }
 

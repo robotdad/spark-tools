@@ -20,7 +20,7 @@ Options:
 
 Preconditions: cluster.env must exist (run 'spark-init' first); sudo required except with --dry-run.
 
-Run 'spark-install-services --help' for full details.
+Use 'spark-install-services --help' for the extended reference (designed for AI agents like Amplifier).
 EOF
     exit 0
 fi

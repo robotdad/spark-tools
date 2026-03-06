@@ -28,7 +28,7 @@ Common usage:
   until spark-check; do sleep 10; done  Poll after spark-serve until ready
   spark-reset && spark-check            Recover then verify
 
-Run 'spark-check --help' for full details.
+Use 'spark-check --help' for the extended reference (designed for AI agents like Amplifier).
 SHORT
     exit 0
 fi
