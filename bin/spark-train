@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# spark-train - Launch distributed training across both DGX Spark nodes
+#
+# Runs a 7-step OOM safety pre-flight on both nodes, then launches
+# torchrun (rank 0 local, rank 1 via SSH) under nohup with cgroup jails.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'SHORT'
+Usage: spark-train [OPTIONS] [-- EXTRA_ARGS...]
+Launch distributed LLM training on the 2-node DGX Spark cluster.
+
+  spark-train                         Launch with defaults from training config
+  spark-train --resume                Resume from latest checkpoint
+  spark-train --resume-from-step N    Resume from specific checkpoint step
+  spark-train --config path/to/cfg    Use specific training config file
+  spark-train --dry-run               Run pre-flight only, don't launch
+  spark-train -- --lr 1e-4            Pass extra args to training script
+
+Runs a 7-step OOM safety pre-flight on both nodes before launch.
+Training blocks inference (and vice versa).
+
+Use 'spark-train --help' for the extended reference (designed for AI agents like Amplifier).
+SHORT
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+spark-train — Launch distributed LLM training on the 2-node DGX Spark cluster
+
+Runs an idempotent 7-step OOM safety pre-flight on both nodes (primary local,
+secondary via SSH), then launches torchrun with one process per node under a
+cgroup memory jail. Training runs in the background (nohup) and survives
+SSH disconnects.
+
+Usage:
+  spark-train [OPTIONS] [-- EXTRA_ARGS...]
+
+Options:
+  --resume              Resume from the latest checkpoint in TRAINING_CHECKPOINT_DIR
+  --resume-from-step N  Resume from a specific checkpoint step number
+  --config PATH         Path to a training config file (passed to training script)
+  --dry-run             Run all pre-flight checks but don't actually launch training
+  --                    Everything after -- is passed directly to the training script
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists (run spark-init)
+  - ~/.config/spark-tools/training.env exists (run spark-train-setup or copy
+    config/training.env.example)
+  - No inference services running on either node (use spark-stop first)
+  - No existing training run active (use spark-train-stop first)
+  - Tokenized data shards present in TRAINING_DATA_DIR on both nodes
+  - Python training environment set up on both nodes (run spark-train-setup)
+
+Pre-flight sequence (applied on BOTH nodes, idempotent):
+  1. Disable swap (swapoff -a) — prevents swap death spiral on unified memory
+  2. Protect SSH from OOM killer (OOMScoreAdjust=-1000, MemoryMin=512M)
+  3. Drop filesystem caches (echo 3 > /proc/sys/vm/drop_caches)
+  4. Verify no inference services are running
+  5. Verify tokenized data shards exist in TRAINING_DATA_DIR
+  6. Verify Python environment (PyTorch, CUDA accessible)
+  7. Launch torchrun under cgroup memory jail (systemd-run MemoryMax)
+
+Launch:
+  Monad (rank 0): torchrun --nproc_per_node=1 --nnodes=2 --node_rank=0
+  Dyad  (rank 1): torchrun --nproc_per_node=1 --nnodes=2 --node_rank=1
+  Both use NCCL over the QSFP fabric for all-reduce communication.
+  Logs: ~/.local/share/spark-tools/training/train.log (on each node)
+  PID:  /tmp/spark-train.pid (monad only — used by spark-train-status/stop)
+
+Configuration:
+  ~/.config/spark-tools/training.env
+    TRAINING_SCRIPT_DIR       Path to training project (must contain train.py)
+    TRAINING_DATA_DIR         Path to tokenized data shards
+    TRAINING_CHECKPOINT_DIR   Path for checkpoint output
+    TRAINING_MEMORY_MAX       Cgroup memory ceiling (default: 100G)
+    CHECKPOINT_TIMEOUT        Graceful stop timeout in seconds (default: 120)
+
+Examples:
+  # Basic launch
+  spark-train
+
+  # Resume from latest checkpoint
+  spark-train --resume
+
+  # Resume from specific step
+  spark-train --resume-from-step 5000
+
+  # Dry run — check everything without launching
+  spark-train --dry-run
+
+  # Pass extra arguments to the training script
+  spark-train -- --lr 1e-4 --batch-size 4
+
+Exit codes:
+  0   Training launched successfully (or dry-run passed)
+  1   Pre-flight check failed, inference running, or training already active
+
+See also:
+  spark-train-status   Check training progress
+  spark-train-stop     Graceful stop with checkpoint save
+  spark-train-resume   Interactive checkpoint selection and resume
+  spark-train-setup    Install training environment
+  spark-train-stage    Stage training data to both nodes
+  spark-stop           Stop inference services (required before training)
+EOF
+
+    echo ""
+    echo "For short help: $(basename "$0") -h"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+spark_load_config
+spark_load_training_config
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+RESUME=false
+RESUME_STEP=""
+TRAIN_CONFIG=""
+DRY_RUN=false
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --resume)
+            RESUME=true
+            shift
+            ;;
+        --resume-from-step)
+            shift
+            RESUME_STEP="${1:-}"
+            [[ -z "$RESUME_STEP" ]] && spark_die "--resume-from-step requires a step number"
+            RESUME=true
+            shift
+            ;;
+        --config)
+            shift
+            TRAIN_CONFIG="${1:-}"
+            [[ -z "$TRAIN_CONFIG" ]] && spark_die "--config requires a path"
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --)
+            shift
+            EXTRA_ARGS=("$@")
+            break
+            ;;
+        *)
+            spark_die "Unknown option: $1. Use --help for usage."
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Derived values
+# ---------------------------------------------------------------------------
+PRIMARY="${SPARK_PRIMARY_HOST}"
+SECONDARY="${SPARK_SECONDARY_HOST}"
+LOG_DIR="${SPARK_TRAINING_LOG_DIR}"
+LOG_FILE="${LOG_DIR}/train.log"
+MASTER_ADDR="${PRIMARY}"
+MASTER_PORT=29500
+
+# Build training script arguments
+TRAIN_ARGS=()
+if [[ "$RESUME" == true ]]; then
+    if [[ -n "$RESUME_STEP" ]]; then
+        TRAIN_ARGS+=(--resume-from-step "$RESUME_STEP")
+    else
+        TRAIN_ARGS+=(--resume)
+    fi
+fi
+[[ -n "$TRAIN_CONFIG" ]] && TRAIN_ARGS+=(--config "$TRAIN_CONFIG")
+TRAIN_ARGS+=("${EXTRA_ARGS[@]+${EXTRA_ARGS[@]}}")
+
+# Flatten TRAIN_ARGS to a string for embedding in nohup commands
+TRAIN_ARGS_STR=""
+for arg in "${TRAIN_ARGS[@]+${TRAIN_ARGS[@]}}"; do
+    TRAIN_ARGS_STR+=" $(printf '%q' "$arg")"
+done
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+PREFLIGHT_FAIL=0
+
+_preflight_pass() { _green "  ✓ $1"; }
+_preflight_fail() { _red   "  ✗ $1"; PREFLIGHT_FAIL=$(( PREFLIGHT_FAIL + 1 )); }
+_preflight_warn() { _yellow "  ~ $1"; }
+
+echo ""
+_bold "=== spark-train Pre-flight ==="
+echo ""
+
+# --- Check: no training already running ---
+_bold "--- Training State ---"
+if spark_training_running; then
+    _preflight_fail "Training already running (PID $(spark_training_pid))"
+    spark_error "Stop the current run first: spark-train-stop"
+    exit 1
+else
+    _preflight_pass "No active training run"
+fi
+echo ""
+
+# --- Check: inference not running (both nodes) ---
+_bold "--- Inference Check ---"
+if spark_inference_running "local"; then
+    _preflight_fail "Inference running on ${PRIMARY}"
+    spark_error "Stop inference first: spark-stop"
+    exit 1
+else
+    _preflight_pass "No inference on ${PRIMARY}"
+fi
+
+if spark_inference_running "${SECONDARY}"; then
+    _preflight_fail "Inference running on ${SECONDARY}"
+    spark_error "Stop inference first: spark-stop"
+    exit 1
+else
+    _preflight_pass "No inference on ${SECONDARY}"
+fi
+echo ""
+
+# --- Check: SSH to secondary ---
+_bold "--- Connectivity ---"
+if spark_ssh "${SECONDARY}" "true" 2>/dev/null; then
+    _preflight_pass "SSH to ${SECONDARY}"
+else
+    _preflight_fail "Cannot SSH to ${SECONDARY}"
+    spark_error "Ensure SSH is configured: ssh ${SECONDARY}"
+    exit 1
+fi
+echo ""
+
+# --- OOM protections (both nodes) ---
+_bold "--- OOM Safety (${PRIMARY}) ---"
+spark_info "Applying OOM protections on ${PRIMARY}..."
+if spark_apply_oom_protection "local"; then
+    _preflight_pass "OOM protections applied on ${PRIMARY}"
+else
+    _preflight_fail "OOM protection failed on ${PRIMARY}"
+fi
+
+_bold "--- OOM Safety (${SECONDARY}) ---"
+spark_info "Applying OOM protections on ${SECONDARY}..."
+if spark_apply_oom_protection "${SECONDARY}"; then
+    _preflight_pass "OOM protections applied on ${SECONDARY}"
+else
+    _preflight_fail "OOM protection failed on ${SECONDARY}"
+fi
+echo ""
+
+# --- Check: data shards exist (both nodes) ---
+_bold "--- Data Verification ---"
+if [[ -d "${TRAINING_DATA_DIR}" ]] && [[ -n "$(ls -A "${TRAINING_DATA_DIR}" 2>/dev/null)" ]]; then
+    local_count=$(find "${TRAINING_DATA_DIR}" -type f 2>/dev/null | wc -l | tr -d ' ')
+    _preflight_pass "Data shards on ${PRIMARY}: ${local_count} files in ${TRAINING_DATA_DIR}"
+else
+    _preflight_fail "No data shards on ${PRIMARY}: ${TRAINING_DATA_DIR}"
+    echo "    Stage data with: spark-train-stage /path/to/source"
+fi
+
+remote_data_check=$(spark_ssh "${SECONDARY}" "
+    if [ -d '${TRAINING_DATA_DIR}' ] && [ -n \"\$(ls -A '${TRAINING_DATA_DIR}' 2>/dev/null)\" ]; then
+        find '${TRAINING_DATA_DIR}' -type f 2>/dev/null | wc -l | tr -d ' '
+    else
+        echo 0
+    fi
+" 2>/dev/null || echo "0")
+
+if [[ "${remote_data_check}" -gt 0 ]]; then
+    _preflight_pass "Data shards on ${SECONDARY}: ${remote_data_check} files in ${TRAINING_DATA_DIR}"
+else
+    _preflight_fail "No data shards on ${SECONDARY}: ${TRAINING_DATA_DIR}"
+    echo "    Stage data with: spark-train-stage /path/to/source"
+fi
+echo ""
+
+# --- Check: Python env (both nodes) ---
+_bold "--- Python Environment ---"
+_check_python_env() {
+    local node="$1"
+    local label="$2"
+    local check_cmd="
+        cd '${TRAINING_SCRIPT_DIR}' 2>/dev/null || exit 1
+        if [ -f .venv/bin/activate ]; then
+            . .venv/bin/activate
+        fi
+        python3 -c 'import torch; assert torch.cuda.is_available(), \"CUDA not available\"; print(f\"PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}\")' 2>&1
+    "
+    local result
+    if [[ "$node" == "local" ]]; then
+        result=$(bash -c "$check_cmd" 2>&1) || result=""
+    else
+        result=$(spark_ssh "$node" "$check_cmd" 2>&1) || result=""
+    fi
+
+    if [[ -n "$result" && "$result" == *"PyTorch"* ]]; then
+        _preflight_pass "${label}: ${result}"
+    else
+        _preflight_fail "${label}: PyTorch/CUDA not ready"
+        echo "    Run: spark-train-setup"
+    fi
+}
+
+_check_python_env "local" "${PRIMARY}"
+_check_python_env "${SECONDARY}" "${SECONDARY}"
+echo ""
+
+# --- Pre-flight summary ---
+if [[ $PREFLIGHT_FAIL -gt 0 ]]; then
+    echo ""
+    _red "=== Pre-flight FAILED: ${PREFLIGHT_FAIL} issue(s) ==="
+    echo ""
+    exit 1
+fi
+
+_green "=== Pre-flight PASSED ==="
+echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+    spark_info "Dry run complete — all checks passed. Exiting without launching."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Launch training
+# ---------------------------------------------------------------------------
+spark_info "Launching training on both nodes..."
+
+# Ensure log directory exists on both nodes
+mkdir -p "${LOG_DIR}"
+spark_ssh "${SECONDARY}" "mkdir -p '${LOG_DIR}'" 2>/dev/null
+
+# Build the torchrun command template
+TORCHRUN_BASE="torchrun --nproc_per_node=1 --nnodes=2 --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT}"
+TRAIN_SCRIPT="${TRAINING_SCRIPT_DIR}/train.py"
+
+# Activation command (if venv exists in training script dir)
+ACTIVATE_CMD=""
+if [[ -f "${TRAINING_SCRIPT_DIR}/.venv/bin/activate" ]]; then
+    ACTIVATE_CMD="source '${TRAINING_SCRIPT_DIR}/.venv/bin/activate' && "
+fi
+
+# --- Launch rank 1 on secondary (via SSH) first ---
+spark_info "Starting rank 1 on ${SECONDARY}..."
+spark_ssh "${SECONDARY}" "nohup bash -c '
+    ${ACTIVATE_CMD}cd \"${TRAINING_SCRIPT_DIR}\" && \
+    echo \"[spark-train] rank 1 started at \$(date)\" > \"${LOG_FILE}\" && \
+    sudo systemd-run --scope -p MemoryMax=${TRAINING_MEMORY_MAX} -- \
+        ${TORCHRUN_BASE} --node_rank=1 ${TRAIN_SCRIPT}${TRAIN_ARGS_STR} >> \"${LOG_FILE}\" 2>&1
+    echo \"[spark-train] rank 1 finished at \$(date) (exit: \$?)\" >> \"${LOG_FILE}\"
+' </dev/null >/dev/null 2>&1 &" 2>/dev/null
+
+_green "  ✓ Rank 1 launched on ${SECONDARY}"
+
+# --- Launch rank 0 on primary (local) ---
+spark_info "Starting rank 0 on ${PRIMARY}..."
+nohup bash -c "
+    ${ACTIVATE_CMD}cd '${TRAINING_SCRIPT_DIR}' && \
+    echo '[spark-train] rank 0 started at \$(date)' > '${LOG_FILE}' && \
+    sudo systemd-run --scope -p MemoryMax=${TRAINING_MEMORY_MAX} -- \
+        ${TORCHRUN_BASE} --node_rank=0 ${TRAIN_SCRIPT}${TRAIN_ARGS_STR} >> '${LOG_FILE}' 2>&1
+    echo '[spark-train] rank 0 finished at \$(date) (exit: \$?)' >> '${LOG_FILE}'
+" </dev/null >/dev/null 2>&1 &
+LOCAL_PID=$!
+
+# Write PID file
+spark_training_write_pid "$LOCAL_PID"
+
+_green "  ✓ Rank 0 launched on ${PRIMARY} (PID ${LOCAL_PID})"
+echo ""
+
+# --- Summary ---
+_bold "=== Training Launched ==="
+echo "  Primary (rank 0):   ${PRIMARY}  PID ${LOCAL_PID}"
+echo "  Secondary (rank 1): ${SECONDARY}"
+echo "  Log:                ${LOG_FILE}"
+echo "  Memory ceiling:     ${TRAINING_MEMORY_MAX} per node"
+echo ""
+echo "Monitor progress:"
+echo "  spark-train-status        # one-shot status"
+echo "  spark-train-status -f     # follow mode"
+echo "  tail -f ${LOG_FILE}"
+echo ""
+echo "Stop training:"
+echo "  spark-train-stop          # graceful (saves checkpoint)"
+echo "  spark-train-stop --immediate  # immediate SIGKILL"

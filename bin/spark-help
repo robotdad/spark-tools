@@ -344,6 +344,56 @@ spark-install-extras [--motd] [--proxy] [--symlinks] [--all]
 
 spark-help
   This reference. No args = full reference. --help = brief meta-description.
+
+--- Training ---
+These commands manage distributed LLM training across both DGX Spark nodes.
+Training and inference are mutually exclusive — stop one before starting the other.
+$(if [[ -f "${SPARK_CONFIG_DIR}/training.env" ]]; then
+    echo "  Training config: ${SPARK_CONFIG_DIR}/training.env"
+else
+    echo "  (run spark-train-setup to configure training)"
+fi)
+
+spark-train [--resume] [--resume-from-step N] [--dry-run] [-- EXTRA_ARGS...]
+  Launch distributed training with OOM safety pre-flight on both nodes.
+  Runs 7-step idempotent safety sequence, then dual-node torchrun.
+  --resume              Resume from latest checkpoint
+  --resume-from-step N  Resume from specific step
+  --dry-run             Pre-flight checks only, don't launch
+  --                    Pass extra arguments to training script
+  Run: spark-train --help
+
+spark-train-status [-f] [--json]
+  Check training progress by reading the training log.
+  Shows step, loss, BPB, learning rate, tokens/sec, checkpoint info.
+  -f / --follow   Live log following (like tail -f)
+  --json          Machine-readable JSON output
+  Exit code: 0 if running, 1 if not.
+  Run: spark-train-status --help
+
+spark-train-stop [--immediate]
+  Graceful training shutdown with checkpoint save.
+  Sends SIGTERM to both nodes, waits CHECKPOINT_TIMEOUT (default: 120s).
+  --immediate    SIGKILL with no waiting (for hung processes)
+  Run: spark-train-stop --help
+
+spark-train-resume [--step N] [--list] [--yes]
+  Resume training from a saved checkpoint.
+  --list         List available checkpoints
+  --step N       Resume from specific step
+  --yes          Skip confirmation prompt
+  Run: spark-train-resume --help
+
+spark-train-setup [--verify-only]
+  Bootstrap training environment on both nodes.
+  Installs: uv venv, PyTorch cu130, CUDA env vars, verifies SDPA + NCCL.
+  --verify-only  Check without modifying anything
+  Run: spark-train-setup --help
+
+spark-train-stage <source-path> [--verify]
+  Stage tokenized training data to both nodes via rsync.
+  --verify       Check file counts without copying
+  Run: spark-train-stage --help
 CMDREF
 
 cat <<WORKFLOWS
@@ -400,6 +450,29 @@ OPERATIONAL WORKFLOWS
   journalctl -u spark-ray-vllm -f                   # cluster (ray) mode
   docker service logs spark_vllm -f                 # swarm mode
   journalctl -u spark-proxy -f                      # auth proxy (all modes)
+
+--- Training workflow ---
+Training and inference are mutually exclusive. Stop inference before training.
+
+  # First-time setup
+  spark-train-setup                    # install Python env on both nodes
+  spark-train-stage /path/to/shards    # stage tokenized data to both nodes
+
+  # Launch training
+  spark-stop                           # stop inference first
+  spark-train                          # launch with OOM safety pre-flight
+  spark-train --dry-run                # pre-flight only, don't launch
+  spark-train-status                   # check progress
+  spark-train-status -f                # follow mode
+
+  # Stop and resume
+  spark-train-stop                     # graceful stop (saves checkpoint)
+  spark-train-resume                   # resume from latest checkpoint
+  spark-train-resume --list            # list available checkpoints
+
+  # Return to inference
+  spark-train-stop                     # stop training first
+  spark-serve                          # start inference
 WORKFLOWS
 
 # Config hierarchy — uses variable interpolation for the actual config path

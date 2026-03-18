@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# spark-train-resume - Resume training from a saved checkpoint
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'SHORT'
+Usage: spark-train-resume [--step N] [--list] [--yes]
+Resume training from a saved checkpoint.
+
+  spark-train-resume           Resume from latest checkpoint (with confirmation)
+  spark-train-resume --step N  Resume from specific step number
+  spark-train-resume --list    List available checkpoints
+  spark-train-resume --yes     Skip confirmation prompt
+
+Use 'spark-train-resume --help' for the extended reference (designed for AI agents like Amplifier).
+SHORT
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+spark-train-resume — Resume training from a saved checkpoint
+
+Finds checkpoints in TRAINING_CHECKPOINT_DIR, shows details, asks for
+confirmation, then delegates to spark-train --resume-from-step N.
+All pre-flight checks still run (OOM safety is reapplied fresh).
+
+Usage:
+  spark-train-resume [OPTIONS]
+
+Options:
+  --step N    Resume from a specific step number
+  --list      List all available checkpoints without resuming
+  --yes       Skip the confirmation prompt (for automation)
+
+Behavior:
+  1. Scans TRAINING_CHECKPOINT_DIR for checkpoint directories
+  2. Sorts by step number (descending)
+  3. Displays checkpoint info (step, size, timestamp)
+  4. Asks for confirmation (unless --yes)
+  5. Delegates to: spark-train --resume-from-step N
+
+Configuration:
+  TRAINING_CHECKPOINT_DIR   Where checkpoints are saved
+                            Set in ~/.config/spark-tools/training.env
+
+Exit codes:
+  0   Training resumed successfully (or --list completed)
+  1   No checkpoints found, user cancelled, or spark-train failed
+
+See also:
+  spark-train        Launch training (called internally by resume)
+  spark-train-stop   Stop training gracefully (saves checkpoint)
+  spark-train-status Check training progress
+EOF
+
+    echo ""
+    echo "For short help: $(basename "$0") -h"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+RESUME_STEP=""
+LIST_ONLY=false
+AUTO_YES=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --step)
+            shift
+            RESUME_STEP="${1:-}"
+            [[ -z "$RESUME_STEP" ]] && spark_die "--step requires a step number"
+            shift
+            ;;
+        --list)  LIST_ONLY=true; shift ;;
+        --yes)   AUTO_YES=true; shift ;;
+        *)       spark_die "Unknown option: $1. Use --help for usage." ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+spark_load_config
+spark_load_training_config
+
+# ---------------------------------------------------------------------------
+# Find checkpoints
+# ---------------------------------------------------------------------------
+CKPT_DIR="${TRAINING_CHECKPOINT_DIR}"
+
+if [[ ! -d "$CKPT_DIR" ]]; then
+    spark_die "Checkpoint directory not found: ${CKPT_DIR}
+No checkpoints to resume from. Start fresh with: spark-train"
+fi
+
+# Find checkpoint directories (step_NNNN or checkpoint_NNNN patterns)
+mapfile -t CKPTS < <(
+    find "$CKPT_DIR" -maxdepth 1 -type d \( -name "step_*" -o -name "checkpoint_*" \) 2>/dev/null \
+    | sort -t_ -k2 -n -r
+)
+
+if [[ ${#CKPTS[@]} -eq 0 ]]; then
+    spark_die "No checkpoints found in ${CKPT_DIR}
+Start fresh with: spark-train"
+fi
+
+# ---------------------------------------------------------------------------
+# List mode
+# ---------------------------------------------------------------------------
+echo ""
+_bold "=== Available Checkpoints ==="
+echo "  Directory: ${CKPT_DIR}"
+echo ""
+
+for ckpt in "${CKPTS[@]}"; do
+    name=$(basename "$ckpt")
+    size=$(du -sh "$ckpt" 2>/dev/null | awk '{print $1}' || echo "?")
+    timestamp=$(stat -c '%y' "$ckpt" 2>/dev/null | cut -d. -f1 || echo "?")
+
+    # Extract step number
+    step_num=$(echo "$name" | grep -oP '\d+' | tail -1 || echo "?")
+
+    printf "  %-24s  step %-6s  %6s  %s\n" "$name" "$step_num" "$size" "$timestamp"
+done
+echo ""
+
+if [[ "$LIST_ONLY" == true ]]; then
+    echo "Resume with: spark-train-resume --step N"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Select checkpoint
+# ---------------------------------------------------------------------------
+if [[ -n "$RESUME_STEP" ]]; then
+    # Find the matching checkpoint
+    TARGET=""
+    for ckpt in "${CKPTS[@]}"; do
+        if echo "$(basename "$ckpt")" | grep -qP "(step|checkpoint)_0*${RESUME_STEP}$"; then
+            TARGET="$ckpt"
+            break
+        fi
+    done
+    if [[ -z "$TARGET" ]]; then
+        spark_die "No checkpoint found for step ${RESUME_STEP} in ${CKPT_DIR}
+Available: $(printf '%s ' "${CKPTS[@]}" | xargs -n1 basename)"
+    fi
+else
+    TARGET="${CKPTS[0]}"
+    RESUME_STEP=$(basename "$TARGET" | grep -oP '\d+' | tail -1)
+fi
+
+TARGET_NAME=$(basename "$TARGET")
+TARGET_SIZE=$(du -sh "$TARGET" 2>/dev/null | awk '{print $1}' || echo "?")
+
+_bold "Selected: ${TARGET_NAME} (${TARGET_SIZE})"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+if [[ "$AUTO_YES" != true ]]; then
+    read -rp "Resume training from step ${RESUME_STEP}? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        echo "Cancelled."
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Delegate to spark-train
+# ---------------------------------------------------------------------------
+echo ""
+spark_info "Resuming from step ${RESUME_STEP}..."
+exec "${SCRIPT_DIR}/spark-train" --resume-from-step "$RESUME_STEP"

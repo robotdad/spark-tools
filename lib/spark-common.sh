@@ -247,3 +247,127 @@ spark_ssh_tty() {
         ssh -t -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@"
     fi
 }
+
+# --- Training Config ---
+# Separate from spark_load_config because training.env is optional and
+# only needed by spark-train-* commands (not every spark-* command).
+SPARK_TRAINING_ENV="${SPARK_CONFIG_DIR}/training.env"
+SPARK_TRAINING_LOG_DIR="${_SPARK_HOME}/.local/share/spark-tools/training"
+SPARK_TRAINING_PID="/tmp/spark-train.pid"
+
+spark_load_training_config() {
+    if [[ ! -f "$SPARK_TRAINING_ENV" ]]; then
+        spark_die "Training config not found: $SPARK_TRAINING_ENV
+Run 'spark-train-setup' to create it, or copy config/training.env.example:
+  cp ${SPARK_TOOLS_DIR}/config/training.env.example ${SPARK_TRAINING_ENV}"
+    fi
+    # shellcheck source=/dev/null
+    source "$SPARK_TRAINING_ENV"
+
+    # Validate required variables
+    [[ -z "${TRAINING_SCRIPT_DIR:-}" ]] && spark_die "TRAINING_SCRIPT_DIR not set in $SPARK_TRAINING_ENV"
+    [[ -z "${TRAINING_DATA_DIR:-}" ]]   && spark_die "TRAINING_DATA_DIR not set in $SPARK_TRAINING_ENV"
+    [[ -z "${TRAINING_CHECKPOINT_DIR:-}" ]] && spark_die "TRAINING_CHECKPOINT_DIR not set in $SPARK_TRAINING_ENV"
+
+    # Apply defaults for optional vars
+    TRAINING_MEMORY_MAX="${TRAINING_MEMORY_MAX:-100G}"
+    CHECKPOINT_TIMEOUT="${CHECKPOINT_TIMEOUT:-120}"
+
+    export TRAINING_SCRIPT_DIR TRAINING_DATA_DIR TRAINING_CHECKPOINT_DIR
+    export TRAINING_MEMORY_MAX CHECKPOINT_TIMEOUT
+}
+
+# --- Training Process Detection ---
+# Check if training is currently running (PID file exists and process alive).
+# Returns 0 if training is running, 1 otherwise.
+spark_training_running() {
+    if [[ -f "$SPARK_TRAINING_PID" ]]; then
+        local pid
+        pid=$(cat "$SPARK_TRAINING_PID" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        # Stale PID file — process is dead, clean up
+        rm -f "$SPARK_TRAINING_PID"
+    fi
+    return 1
+}
+
+# Get the training PID (if running). Prints PID to stdout, returns 1 if not running.
+spark_training_pid() {
+    if spark_training_running; then
+        cat "$SPARK_TRAINING_PID"
+        return 0
+    fi
+    return 1
+}
+
+# Write training PID file
+spark_training_write_pid() {
+    local pid="$1"
+    echo "$pid" > "$SPARK_TRAINING_PID"
+}
+
+# Remove training PID file
+spark_training_remove_pid() {
+    rm -f "$SPARK_TRAINING_PID"
+}
+
+# --- OOM Protection ---
+# Apply memory safety protections on a node. Idempotent — safe to call every time.
+# Usage: spark_apply_oom_protection [node]
+#   node = "local" (default) or a hostname (runs via spark_ssh)
+spark_apply_oom_protection() {
+    local node="${1:-local}"
+    local mem_max="${TRAINING_MEMORY_MAX:-100G}"
+
+    local cmds="
+        # 1. Disable swap
+        sudo swapoff -a 2>/dev/null || true
+
+        # 2. Protect SSH from OOM killer
+        sudo mkdir -p /etc/systemd/system/ssh.service.d
+        echo '[Service]
+OOMScoreAdjust=-1000
+MemoryMin=512M' | sudo tee /etc/systemd/system/ssh.service.d/oom.conf >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd 2>/dev/null || true
+
+        # 3. Drop filesystem caches
+        sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+    "
+
+    if [[ "$node" == "local" ]]; then
+        eval "$cmds"
+    else
+        spark_ssh "$node" "$cmds"
+    fi
+}
+
+# Check if inference is running on a node.
+# Returns 0 if any inference process detected, 1 otherwise.
+# Usage: spark_inference_running [node]
+#   node = "local" (default) or a hostname
+spark_inference_running() {
+    local node="${1:-local}"
+
+    local check_cmd='
+        # Check systemd services
+        for svc in spark-vllm-standalone vllm vllm-ray-head spark-ray-vllm; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                exit 0
+            fi
+        done
+        # Check Docker stack
+        if docker stack ls 2>/dev/null | grep -q "^spark"; then
+            exit 0
+        fi
+        exit 1
+    '
+
+    if [[ "$node" == "local" ]]; then
+        bash -c "$check_cmd" 2>/dev/null
+    else
+        spark_ssh "$node" "$check_cmd" 2>/dev/null
+    fi
+}

@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# spark-train-setup - Bootstrap training environment on both cluster nodes
+#
+# Creates a uv venv, installs PyTorch/vLLM from cu130 wheels, sets CUDA 13
+# env vars, and verifies CUDA/SM121, SDPA, and NCCL connectivity.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'SHORT'
+Usage: spark-train-setup [--verify-only]
+Bootstrap the training environment on both cluster nodes.
+
+  spark-train-setup              Full setup: create venv, install packages, verify
+  spark-train-setup --verify-only  Skip install steps, verify existing environment
+
+Sets up PyTorch (cu130), vLLM (cu130 nightly), and CUDA 13 env vars in
+the venv on both cluster nodes. Runs CUDA/SM121 and SDPA checks.
+
+Use 'spark-train-setup --help' for the extended reference (designed for AI agents like Amplifier).
+SHORT
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+spark-train-setup — Bootstrap training environment on both cluster nodes
+
+Creates a Python venv in TRAINING_SCRIPT_DIR, installs PyTorch from cu130
+wheels, installs vLLM from cu130 nightly, sets CUDA 13 environment variables
+in the venv, and verifies GPU access (CUDA, SM121) and SDPA functionality on
+both cluster nodes.
+
+Usage:
+  spark-train-setup [--verify-only]
+
+Options:
+  --verify-only   Skip venv creation and package installation; run checks only.
+                  Use to verify an existing environment without modifying it.
+
+Setup steps (per node):
+  1. Check TRAINING_SCRIPT_DIR exists
+  2. Create uv venv (Python 3.12) or fall back to python3 -m venv
+  3. Install PyTorch from https://download.pytorch.org/whl/cu130
+  4. Install vLLM from https://wheels.vllm.ai/nightly/cu130 (pre-release)
+  5. Install project deps (pyproject.toml or requirements.txt if present)
+  6. Patch venv/bin/activate with CUDA 13 env vars (idempotent)
+  7. Verify CUDA access and SM121 (Blackwell) compatibility
+  8. Verify scaled_dot_product_attention works end-to-end
+
+CUDA 13 env vars added to venv/bin/activate:
+  TORCH_CUDA_ARCH_LIST="12.1a"
+  TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
+  PATH=/usr/local/cuda-13.0/bin:${PATH}
+  LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH:-}
+
+NCCL connectivity:
+  The script prints the manual NCCL test command but does not auto-run it.
+  Run it manually to verify inter-node all-reduce over the QSFP fabric.
+
+Preconditions:
+  - ~/.config/spark-tools/cluster.env exists (run spark-init)
+  - TRAINING_SCRIPT_DIR is accessible on both nodes
+  - SSH to secondary node is configured
+  - CUDA 13 is installed at /usr/local/cuda-13.0
+
+Configuration:
+  ~/.config/spark-tools/training.env
+    TRAINING_SCRIPT_DIR       Path to training project directory
+    TRAINING_DATA_DIR         Path to tokenized data shards
+    TRAINING_CHECKPOINT_DIR   Path for checkpoint output
+    (created from config/training.env.example if not present)
+
+Exit codes:
+  0   All checks passed
+  1   One or more checks failed
+
+See also:
+  spark-train          Launch training (requires setup to pass)
+  spark-train-status   Check training progress
+  spark-train-stage    Stage training data to both nodes
+  spark-train-stop     Stop training gracefully
+EOF
+
+    echo ""
+    echo "For short help: $(basename "$0") -h"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+VERIFY_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verify-only) VERIFY_ONLY=true; shift ;;
+        *) spark_die "Unknown option: $1. Use --help for usage." ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+spark_load_config
+
+# If training.env doesn't exist and not --verify-only, seed from example
+if [[ ! -f "${SPARK_TRAINING_ENV}" ]] && [[ "$VERIFY_ONLY" == false ]]; then
+    spark_info "training.env not found — creating from example..."
+    mkdir -p "$(dirname "${SPARK_TRAINING_ENV}")"
+    cp "${SPARK_TOOLS_DIR}/config/training.env.example" "${SPARK_TRAINING_ENV}"
+    _green "  ✓ Created ${SPARK_TRAINING_ENV}"
+    echo ""
+    spark_warn "Review and edit ${SPARK_TRAINING_ENV} before launching training"
+    spark_warn "Required: TRAINING_SCRIPT_DIR, TRAINING_DATA_DIR, TRAINING_CHECKPOINT_DIR"
+    echo ""
+fi
+
+spark_load_training_config
+
+# ---------------------------------------------------------------------------
+# Counters
+# ---------------------------------------------------------------------------
+_setup_pass=0
+_setup_fail=0
+_setup_warn=0
+
+_pass() { _green  "  ✓ $*"; _setup_pass=$(( _setup_pass + 1 )); }
+_fail() { _red    "  ✗ $*"; _setup_fail=$(( _setup_fail + 1 )); }
+_warn() { _yellow "  ~ $*"; _setup_warn=$(( _setup_warn + 1 )); }
+
+# ---------------------------------------------------------------------------
+# Node exec helper — run a command locally or via SSH
+# ---------------------------------------------------------------------------
+_node_exec() {
+    local node="$1"
+    local cmd="$2"
+    if [[ "$node" == "local" ]]; then
+        bash -c "$cmd"
+    else
+        spark_ssh "$node" "$cmd"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Per-node setup function
+# ---------------------------------------------------------------------------
+_setup_node() {
+    local label="$1"
+    local node="$2"
+
+    echo ""
+    _bold "=== Setup: ${label} ==="
+    echo ""
+
+    # --- Step 1: Training script directory ---
+    _bold "--- Training Script Directory ---"
+    if _node_exec "$node" "test -d '${TRAINING_SCRIPT_DIR}'" 2>/dev/null; then
+        _pass "TRAINING_SCRIPT_DIR exists: ${TRAINING_SCRIPT_DIR}"
+    else
+        _fail "TRAINING_SCRIPT_DIR not found: ${TRAINING_SCRIPT_DIR}"
+        echo "    Create the directory or edit ${SPARK_TRAINING_ENV}"
+        return 0  # Can't continue without the directory; fail already counted
+    fi
+    echo ""
+
+    # --- Steps 2 & 3: Create and verify venv ---
+    _bold "--- Python venv ---"
+    if [[ "$VERIFY_ONLY" == false ]]; then
+        spark_info "Creating venv (Python 3.12)..."
+        local venv_cmd="
+            cd '${TRAINING_SCRIPT_DIR}'
+            if command -v uv >/dev/null 2>&1; then
+                uv venv --python 3.12 .venv 2>&1
+            else
+                python3 -m venv .venv 2>&1
+            fi
+        "
+        if _node_exec "$node" "$venv_cmd"; then
+            _pass "venv created"
+        else
+            _fail "venv creation failed"
+        fi
+    fi
+
+    if _node_exec "$node" "test -f '${TRAINING_SCRIPT_DIR}/.venv/bin/activate'" 2>/dev/null; then
+        _pass "venv exists: ${TRAINING_SCRIPT_DIR}/.venv"
+    else
+        _fail "venv not found: ${TRAINING_SCRIPT_DIR}/.venv"
+        [[ "$VERIFY_ONLY" == true ]] && echo "    Run without --verify-only to create it"
+        return 0  # No venv — remaining checks would all fail
+    fi
+    echo ""
+
+    # --- Step 4: Install packages ---
+    _bold "--- Package Installation ---"
+    if [[ "$VERIFY_ONLY" == false ]]; then
+        spark_info "Installing PyTorch (cu130)..."
+        local torch_cmd="
+            cd '${TRAINING_SCRIPT_DIR}' && . .venv/bin/activate
+            if command -v uv >/dev/null 2>&1; then
+                uv pip install torch torchvision torchaudio \
+                    --index-url https://download.pytorch.org/whl/cu130
+            else
+                pip install torch torchvision torchaudio \
+                    --index-url https://download.pytorch.org/whl/cu130
+            fi
+        "
+        if _node_exec "$node" "$torch_cmd"; then
+            _pass "PyTorch (cu130) installed"
+        else
+            _fail "PyTorch (cu130) installation failed"
+        fi
+
+        spark_info "Installing vLLM (cu130 nightly)..."
+        local vllm_cmd="
+            cd '${TRAINING_SCRIPT_DIR}' && . .venv/bin/activate
+            if command -v uv >/dev/null 2>&1; then
+                uv pip install vllm --pre \
+                    --extra-index-url https://wheels.vllm.ai/nightly/cu130
+            else
+                pip install vllm --pre \
+                    --extra-index-url https://wheels.vllm.ai/nightly/cu130
+            fi
+        "
+        if _node_exec "$node" "$vllm_cmd"; then
+            _pass "vLLM (cu130 nightly) installed"
+        else
+            _fail "vLLM installation failed"
+        fi
+
+        spark_info "Installing project dependencies..."
+        local deps_cmd="
+            cd '${TRAINING_SCRIPT_DIR}' && . .venv/bin/activate
+            if [ -f pyproject.toml ]; then
+                if command -v uv >/dev/null 2>&1; then
+                    uv pip install -e . 2>&1
+                else
+                    pip install -e . 2>&1
+                fi
+            elif [ -f requirements.txt ]; then
+                if command -v uv >/dev/null 2>&1; then
+                    uv pip install -r requirements.txt 2>&1
+                else
+                    pip install -r requirements.txt 2>&1
+                fi
+            else
+                echo 'No pyproject.toml or requirements.txt — skipping project deps'
+            fi
+        "
+        if _node_exec "$node" "$deps_cmd"; then
+            _pass "Project dependencies done"
+        else
+            _warn "Project dependencies had issues (may be OK if no pyproject.toml)"
+        fi
+    else
+        _warn "Package installation skipped (--verify-only)"
+    fi
+    echo ""
+
+    # --- Step 5: CUDA 13 env vars in venv/bin/activate ---
+    _bold "--- CUDA 13 Environment ---"
+    if [[ "$VERIFY_ONLY" == false ]]; then
+        # Use printf to append each line — avoids heredoc-over-SSH quoting issues.
+        # \${PATH} and \${LD_LIBRARY_PATH:-} are escaped so they appear as
+        # literal ${PATH} / ${LD_LIBRARY_PATH:-} in the activate file (expanded
+        # at source time, not at patch time).
+        local cuda_patch_cmd="
+            ACTIVATE=\"${TRAINING_SCRIPT_DIR}/.venv/bin/activate\"
+            if [ ! -f \"\$ACTIVATE\" ]; then
+                echo 'ERROR: activate not found' >&2
+                exit 1
+            fi
+            if ! grep -q 'TORCH_CUDA_ARCH_LIST' \"\$ACTIVATE\"; then
+                printf '\\n# --- CUDA 13 / SM121 (added by spark-train-setup) ---\\n' >> \"\$ACTIVATE\"
+                printf 'export TORCH_CUDA_ARCH_LIST=\"12.1a\"\\n' >> \"\$ACTIVATE\"
+                printf 'export TRITON_PTXAS_PATH=\"/usr/local/cuda-13.0/bin/ptxas\"\\n' >> \"\$ACTIVATE\"
+                printf 'export PATH=\"/usr/local/cuda-13.0/bin:\${PATH}\"\\n' >> \"\$ACTIVATE\"
+                printf 'export LD_LIBRARY_PATH=\"/usr/local/cuda-13.0/lib64:\${LD_LIBRARY_PATH:-}\"\\n' >> \"\$ACTIVATE\"
+                echo 'added'
+            else
+                echo 'already present'
+            fi
+        "
+        local patch_out
+        patch_out=$(_node_exec "$node" "$cuda_patch_cmd" 2>&1) || patch_out="failed"
+        case "$patch_out" in
+            *added*)          _pass "CUDA 13 env vars added to venv/bin/activate" ;;
+            *already\ present*) _pass "CUDA 13 env vars already present (idempotent)" ;;
+            *)                _fail "CUDA 13 env patch: ${patch_out}" ;;
+        esac
+    fi
+
+    # Verify vars are present regardless of mode
+    if _node_exec "$node" "grep -q 'TORCH_CUDA_ARCH_LIST' '${TRAINING_SCRIPT_DIR}/.venv/bin/activate' 2>/dev/null" 2>/dev/null; then
+        _pass "TORCH_CUDA_ARCH_LIST present in venv/bin/activate"
+    else
+        _warn "TORCH_CUDA_ARCH_LIST not in venv/bin/activate"
+        [[ "$VERIFY_ONLY" == true ]] && echo "    Run without --verify-only to add CUDA 13 env vars"
+    fi
+    echo ""
+
+    # --- Step 6: CUDA access and SM121 compatibility ---
+    _bold "--- CUDA / SM121 Verification ---"
+    local cuda_check="
+        cd '${TRAINING_SCRIPT_DIR}'
+        if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi
+        python3 -c '
+import sys, torch
+if not torch.cuda.is_available():
+    print(\"FAIL: CUDA not available\")
+    sys.exit(1)
+cap = torch.cuda.get_device_capability()
+if cap < (12, 1):
+    print(f\"FAIL: Need SM 12.1+, got SM {cap[0]}.{cap[1]}\")
+    sys.exit(1)
+name = torch.cuda.get_device_name(0)
+print(f\"CUDA OK: {name}, SM {cap[0]}.{cap[1]}, PyTorch {torch.__version__}\")
+' 2>&1
+    "
+    local cuda_result
+    cuda_result=$(_node_exec "$node" "$cuda_check" 2>&1) || cuda_result="check failed to run"
+    if echo "$cuda_result" | grep -q "^CUDA OK"; then
+        _pass "${cuda_result}"
+    else
+        _fail "CUDA/SM121: ${cuda_result}"
+        echo "    Run: spark-train-setup (without --verify-only) to reinstall"
+    fi
+    echo ""
+
+    # --- Step 7: SDPA verification ---
+    _bold "--- SDPA Verification ---"
+    local sdpa_check="
+        cd '${TRAINING_SCRIPT_DIR}'
+        if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi
+        python3 -c '
+import sys, torch
+if not torch.cuda.is_available():
+    print(\"FAIL: CUDA not available\")
+    sys.exit(1)
+q = torch.randn(1, 1, 8, 64, device=\"cuda\", dtype=torch.bfloat16)
+k = torch.randn(1, 1, 8, 64, device=\"cuda\", dtype=torch.bfloat16)
+v = torch.randn(1, 1, 8, 64, device=\"cuda\", dtype=torch.bfloat16)
+out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+print(f\"SDPA OK: output {out.shape}, dtype {out.dtype}\")
+' 2>&1
+    "
+    local sdpa_result
+    sdpa_result=$(_node_exec "$node" "$sdpa_check" 2>&1) || sdpa_result="check failed to run"
+    if echo "$sdpa_result" | grep -q "^SDPA OK"; then
+        _pass "${sdpa_result}"
+    else
+        _fail "SDPA: ${sdpa_result}"
+        echo "    PyTorch install may be incomplete — run spark-train-setup to reinstall"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Run setup on both nodes
+# ---------------------------------------------------------------------------
+PRIMARY="${SPARK_PRIMARY_HOST}"
+SECONDARY="${SPARK_SECONDARY_HOST}"
+
+echo ""
+_bold "=== spark-train-setup ==="
+if [[ "$VERIFY_ONLY" == true ]]; then
+    echo "  Mode:       verify-only (skipping install steps)"
+else
+    echo "  Mode:       full setup"
+fi
+echo "  Primary:    ${PRIMARY}"
+echo "  Secondary:  ${SECONDARY}"
+echo "  Script dir: ${TRAINING_SCRIPT_DIR}"
+echo ""
+
+# Primary node (local)
+_setup_node "${PRIMARY}" "local"
+
+# Secondary node — check SSH connectivity first
+echo ""
+_bold "--- Connectivity to ${SECONDARY} ---"
+if spark_ssh "${SECONDARY}" "true" 2>/dev/null; then
+    _pass "SSH to ${SECONDARY}"
+    _setup_node "${SECONDARY}" "${SECONDARY}"
+else
+    _fail "Cannot SSH to ${SECONDARY} — skipping secondary setup"
+    echo "    Ensure SSH is configured: ssh ${SECONDARY}"
+fi
+
+# ---------------------------------------------------------------------------
+# NCCL connectivity test (manual — not auto-run)
+# ---------------------------------------------------------------------------
+echo ""
+_bold "=== NCCL Connectivity Test ==="
+echo ""
+echo "  The NCCL test must be run manually on both nodes simultaneously."
+echo "  It verifies inter-node all-reduce over the QSFP fabric."
+echo ""
+echo "  # On ${PRIMARY} (run first, then immediately run on ${SECONDARY}):"
+echo "  MASTER_ADDR=${PRIMARY} MASTER_PORT=29500 WORLD_SIZE=2 RANK=0 \\"
+echo "  NCCL_DEBUG=INFO NCCL_IB_DISABLE=0 NCCL_NET_GDR_LEVEL=5 \\"
+echo "    python3 -c \""
+echo "      import torch, torch.distributed as dist"
+echo "      dist.init_process_group('nccl', init_method='env://', rank=0, world_size=2)"
+echo "      t = torch.ones(1).cuda()"
+echo "      dist.all_reduce(t)"
+echo "      print(f'NCCL all-reduce OK on rank 0: {t.item()}')"
+echo "    \""
+echo ""
+echo "  # On ${SECONDARY} (run concurrently — change RANK=1):"
+echo "  MASTER_ADDR=${PRIMARY} MASTER_PORT=29500 WORLD_SIZE=2 RANK=1 \\"
+echo "  NCCL_DEBUG=INFO NCCL_IB_DISABLE=0 NCCL_NET_GDR_LEVEL=5 \\"
+echo "    python3 -c \"... (same, rank=1) ...\""
+echo ""
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo ""
+_bold "=== Setup Summary ==="
+echo ""
+_green "  Pass: ${_setup_pass}"
+if [[ $_setup_warn -gt 0 ]]; then
+    _yellow "  Warn: ${_setup_warn}"
+fi
+if [[ $_setup_fail -gt 0 ]]; then
+    _red "  Fail: ${_setup_fail}"
+fi
+echo ""
+
+if [[ $_setup_fail -gt 0 ]]; then
+    _red "=== Setup FAILED: ${_setup_fail} issue(s) ==="
+    echo ""
+    exit 1
+fi
+
+_green "=== Setup PASSED ==="
+echo ""
+
+if [[ "$VERIFY_ONLY" == false ]]; then
+    echo "Next steps:"
+    echo "  1. Review config:       ${SPARK_TRAINING_ENV}"
+    echo "  2. Stage training data: spark-train-stage /path/to/data"
+    echo "  3. Launch training:     spark-train"
+    echo ""
+fi

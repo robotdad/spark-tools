@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# spark-train-status - Check training progress by reading the training log
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+source "${SCRIPT_DIR}/../lib/spark-common.sh"
+
+if [[ "${1:-}" == "-h" ]]; then
+    cat <<'SHORT'
+Usage: spark-train-status [OPTIONS]
+Check training progress by reading the training log.
+
+  spark-train-status          One-shot status display
+  spark-train-status -f       Follow mode (like tail -f)
+  spark-train-status --json   Machine-readable output (for agents)
+
+Exit code: 0 if training is running, 1 if not.
+
+Use 'spark-train-status --help' for the extended reference (designed for AI agents like Amplifier).
+SHORT
+    exit 0
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+spark-train-status — Check training progress by reading the training log
+
+Reads the training log file and parses out key metrics: current step,
+training loss, validation BPB, learning rate, tokens/sec, and ETA.
+Also reports checkpoint status (last saved step, disk usage).
+
+Usage:
+  spark-train-status [OPTIONS]
+
+Options:
+  -f, --follow   Follow mode — continuously display new log lines (like tail -f)
+  --json         Machine-readable JSON output for agents and automation
+  --log          Print the raw log file path (useful for custom tail commands)
+
+Output:
+  Training Status:
+    Process:      Running (PID 12345) | Stopped
+    Runtime:      2h 15m 30s
+    Current Step: 1500 / 10000
+    Train Loss:   2.345
+    Val BPB:      1.234
+    Learning Rate: 3.0e-4
+    Tokens/sec:   12345
+    Checkpoint:   step_1000 (1.2G)
+
+Exit codes:
+  0   Training is currently running
+  1   Training is not running (or no log file found)
+
+See also:
+  spark-train        Launch training
+  spark-train-stop   Stop training gracefully
+  spark-train-resume Resume from checkpoint
+EOF
+
+    echo ""
+    echo "For short help: $(basename "$0") -h"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+FOLLOW=false
+JSON_OUTPUT=false
+SHOW_LOG=false
+
+for arg in "$@"; do
+    case "$arg" in
+        -f|--follow) FOLLOW=true ;;
+        --json)      JSON_OUTPUT=true ;;
+        --log)       SHOW_LOG=true ;;
+        *)           spark_die "Unknown option: $arg. Use --help for usage." ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+spark_load_config
+
+LOG_DIR="${SPARK_TRAINING_LOG_DIR}"
+LOG_FILE="${LOG_DIR}/train.log"
+
+if [[ "$SHOW_LOG" == true ]]; then
+    echo "${LOG_FILE}"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Check if training is running
+# ---------------------------------------------------------------------------
+RUNNING=false
+TRAIN_PID=""
+if spark_training_running; then
+    RUNNING=true
+    TRAIN_PID=$(spark_training_pid)
+fi
+
+# Check log file exists
+if [[ ! -f "$LOG_FILE" ]]; then
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        echo '{"running":false,"error":"no log file"}'
+    else
+        echo "No training log found at: ${LOG_FILE}"
+        echo ""
+        echo "Start training with: spark-train"
+    fi
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Follow mode
+# ---------------------------------------------------------------------------
+if [[ "$FOLLOW" == true ]]; then
+    if [[ "$RUNNING" != true ]]; then
+        spark_warn "Training is not running — showing last lines of log"
+    fi
+    exec tail -f "$LOG_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# Parse log for metrics
+# ---------------------------------------------------------------------------
+# Extract last line matching common training log patterns
+LAST_STEP=$(grep -oP 'step[=: ]\K\d+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+LAST_LOSS=$(grep -oP 'loss[=: ]\K[0-9.]+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+LAST_BPB=$(grep -oP '[Bb][Pp][Bb][=: ]\K[0-9.]+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+LAST_LR=$(grep -oP 'lr[=: ]\K[0-9.eE+-]+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+LAST_TOKS=$(grep -oP 'tok(?:ens)?(?:/s|_per_sec)[=: ]\K[0-9.]+' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+
+# Calculate runtime from PID if running
+RUNTIME=""
+if [[ "$RUNNING" == true && -n "$TRAIN_PID" ]]; then
+    # Get process start time via /proc
+    if [[ -d "/proc/${TRAIN_PID}" ]]; then
+        START_SEC=$(stat -c %Y "/proc/${TRAIN_PID}" 2>/dev/null || echo "")
+        if [[ -n "$START_SEC" ]]; then
+            NOW_SEC=$(date +%s)
+            ELAPSED=$(( NOW_SEC - START_SEC ))
+            HOURS=$(( ELAPSED / 3600 ))
+            MINS=$(( (ELAPSED % 3600) / 60 ))
+            SECS=$(( ELAPSED % 60 ))
+            RUNTIME="${HOURS}h ${MINS}m ${SECS}s"
+        fi
+    fi
+fi
+
+# Checkpoint info
+CKPT_INFO=""
+CKPT_SIZE=""
+if [[ -n "${TRAINING_CHECKPOINT_DIR:-}" && -d "${TRAINING_CHECKPOINT_DIR:-}" ]]; then
+    LATEST_CKPT=$(ls -td "${TRAINING_CHECKPOINT_DIR}"/step_* "${TRAINING_CHECKPOINT_DIR}"/checkpoint_* 2>/dev/null | head -1 || echo "")
+    if [[ -n "$LATEST_CKPT" ]]; then
+        CKPT_INFO=$(basename "$LATEST_CKPT")
+        CKPT_SIZE=$(du -sh "$LATEST_CKPT" 2>/dev/null | awk '{print $1}' || echo "?")
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+if [[ "$JSON_OUTPUT" == true ]]; then
+    cat <<ENDJSON
+{"running":${RUNNING},"pid":"${TRAIN_PID}","runtime":"${RUNTIME}","step":"${LAST_STEP}","loss":"${LAST_LOSS}","bpb":"${LAST_BPB}","lr":"${LAST_LR}","tokens_per_sec":"${LAST_TOKS}","checkpoint":"${CKPT_INFO}","checkpoint_size":"${CKPT_SIZE}","log_file":"${LOG_FILE}"}
+ENDJSON
+    if [[ "$RUNNING" == true ]]; then exit 0; else exit 1; fi
+fi
+
+# ---------------------------------------------------------------------------
+# Human-readable output
+# ---------------------------------------------------------------------------
+echo ""
+_bold "=== Training Status ==="
+echo ""
+
+if [[ "$RUNNING" == true ]]; then
+    _green "  Process:       Running (PID ${TRAIN_PID})"
+else
+    _red   "  Process:       Stopped"
+fi
+
+[[ -n "$RUNTIME" ]]    && printf "  Runtime:       %s\n" "$RUNTIME"
+[[ -n "$LAST_STEP" ]]  && printf "  Current Step:  %s\n" "$LAST_STEP"
+[[ -n "$LAST_LOSS" ]]  && printf "  Train Loss:    %s\n" "$LAST_LOSS"
+[[ -n "$LAST_BPB" ]]   && printf "  Val BPB:       %s\n" "$LAST_BPB"
+[[ -n "$LAST_LR" ]]    && printf "  Learning Rate: %s\n" "$LAST_LR"
+[[ -n "$LAST_TOKS" ]]  && printf "  Tokens/sec:    %s\n" "$LAST_TOKS"
+
+if [[ -n "$CKPT_INFO" ]]; then
+    printf "  Checkpoint:    %s (%s)\n" "$CKPT_INFO" "$CKPT_SIZE"
+fi
+
+echo ""
+printf "  Log: %s\n" "$LOG_FILE"
+echo ""
+
+if [[ "$RUNNING" == true ]]; then exit 0; else exit 1; fi

@@ -136,6 +136,20 @@ fi
 
 spark_load_config
 
+# Block if training is running on either node
+if spark_training_running; then
+    spark_die "Training is running (PID $(spark_training_pid)).
+Stop training first: spark-train-stop
+Then start inference: spark-serve"
+fi
+
+# Check remote node for training too
+if spark_ssh "${SPARK_SECONDARY_HOST}" "test -f /tmp/spark-train.pid && kill -0 \$(cat /tmp/spark-train.pid) 2>/dev/null" 2>/dev/null; then
+    spark_die "Training is running on ${SPARK_SECONDARY_HOST}.
+Stop training first: spark-train-stop
+Then start inference: spark-serve"
+fi
+
 # Optional model override from CLI
 if [[ $# -ge 1 && "$1" != -* ]]; then
     export MODEL_NAME="$1"

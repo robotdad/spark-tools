@@ -485,6 +485,40 @@ else
     WARN=$(( WARN + 1 ))
 fi
 
+# ---------------------------------------------------------------------------
+# Common: Training status
+# ---------------------------------------------------------------------------
+echo ""
+_bold "--- Training ---"
+if spark_training_running; then
+    TRAIN_PID=$(spark_training_pid)
+    _green "  ✓ Training active (PID ${TRAIN_PID})"
+    PASS=$(( PASS + 1 ))
+    _json_check "Training" "pass" "active (PID ${TRAIN_PID})"
+
+    # Show step and runtime if log exists
+    _TRAIN_LOG="${SPARK_TRAINING_LOG_DIR}/train.log"
+    if [[ -f "$_TRAIN_LOG" ]]; then
+        _TRAIN_STEP=$(grep -oP 'step[=: ]\K\d+' "$_TRAIN_LOG" 2>/dev/null | tail -1 || echo "")
+        [[ -n "$_TRAIN_STEP" ]] && echo "    Step: ${_TRAIN_STEP}"
+
+        # Runtime from PID
+        if [[ -d "/proc/${TRAIN_PID}" ]]; then
+            _T_START=$(stat -c %Y "/proc/${TRAIN_PID}" 2>/dev/null || echo "")
+            if [[ -n "$_T_START" ]]; then
+                _T_NOW=$(date +%s)
+                _T_ELAPSED=$(( _T_NOW - _T_START ))
+                _T_H=$(( _T_ELAPSED / 3600 ))
+                _T_M=$(( (_T_ELAPSED % 3600) / 60 ))
+                echo "    Runtime: ${_T_H}h ${_T_M}m"
+            fi
+        fi
+    fi
+else
+    echo "  Training: not running"
+    _json_check "Training" "pass" "not running"
+fi
+
 # --- JSON output ---
 if [[ "$JSON_OUTPUT" == true ]]; then
     exec 1>&3  # restore real stdout
