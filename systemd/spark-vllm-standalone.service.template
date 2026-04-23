@@ -36,6 +36,8 @@ ExecStart=/usr/bin/bash -c '\
   --gpus all \
   --shm-size 10.24g \
   -v /home/{{USERNAME}}/.cache/huggingface:/root/.cache/huggingface \
+  -v /etc/encodings:/etc/encodings \
+  -e TIKTOKEN_ENCODINGS_BASE=/etc/encodings \
   -e VLLM_FLASHINFER_MOE_BACKEND=latency \
   {{VLLM_IMAGE}} \
   vllm serve "$MODEL_NAME" \
