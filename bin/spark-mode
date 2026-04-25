@@ -415,15 +415,24 @@ case "${1:-}" in
 
         # ── status ────────────────────────────────────────────────────────────
         # Query the /v1/models endpoint on a host:port.
+        # Optional $3 = bearer token for auth.
         # Prints the model ID(s) or "(no response)" on failure.
         _query_models() {
-            local host="$1" port="$2"
+            local host="$1" port="$2" token="${3:-}"
             local url="http://${host}:${port}/v1/models"
             local resp
-            resp="$(curl -sf --connect-timeout 3 --max-time 5 "$url" 2>/dev/null)" || {
-                echo "(no response)"
-                return 1
-            }
+            if [[ -n "$token" ]]; then
+                resp="$(curl -sf --connect-timeout 3 --max-time 5 \
+                    -H "Authorization: Bearer ${token}" "$url" 2>/dev/null)" || {
+                    echo "(no response)"
+                    return 1
+                }
+            else
+                resp="$(curl -sf --connect-timeout 3 --max-time 5 "$url" 2>/dev/null)" || {
+                    echo "(no response)"
+                    return 1
+                }
+            fi
             echo "$resp" | python3 -c "
 import sys, json
 try:
@@ -495,11 +504,30 @@ except: print('(parse error)')
 
             echo ""
             # ── proxy ─────────────────────────────────────────────────────
+            local _proxy_port="${SPARK_PROXY_PORT:-9000}"
+            local _proxy_token=""
+            local _proxy_secret_file="${_SPARK_HOME}/.config/vllm-proxy/secret.env"
+            if [[ -f "${_proxy_secret_file}" ]]; then
+                _proxy_token="$(grep '^VLLM_PROXY_SECRET=' "${_proxy_secret_file}" 2>/dev/null | cut -d= -f2 | sed "s/['\"']//g")"
+            fi
+
             if systemctl is-active --quiet spark-proxy 2>/dev/null; then
-                _green "spark-proxy: active (port ${SPARK_PROXY_PORT:-9000})"
+                _green "spark-proxy: active (port ${_proxy_port})"
+                if [[ -n "${_proxy_token}" ]]; then
+                    local _proxy_models
+                    _proxy_models="$(_query_models localhost "${_proxy_port}" "${_proxy_token}")"
+                    echo "  models: ${_proxy_models}"
+                fi
             else
                 _yellow "spark-proxy: inactive"
             fi
+
+            # ── endpoints ─────────────────────────────────────────────────
+            echo ""
+            _bold "Endpoints"
+            echo "  proxy (all models): http://${SPARK_PRIMARY_HOST:-monad}:${_proxy_port}/v1  (auth required)"
+            echo "  direct monad:       http://${SPARK_PRIMARY_HOST:-monad}:${port}/v1"
+            echo "  direct dyad:        http://${_DYAD:-dyad}:${port}/v1"
         }
 
         # ── split ─────────────────────────────────────────────────────────────
