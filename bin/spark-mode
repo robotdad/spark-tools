@@ -414,30 +414,62 @@ case "${1:-}" in
         }
 
         # ── status ────────────────────────────────────────────────────────────
+        # Query the /v1/models endpoint on a host:port.
+        # Prints the model ID(s) or "(no response)" on failure.
+        _query_models() {
+            local host="$1" port="$2"
+            local url="http://${host}:${port}/v1/models"
+            local resp
+            resp="$(curl -sf --connect-timeout 3 --max-time 5 "$url" 2>/dev/null)" || {
+                echo "(no response)"
+                return 1
+            }
+            echo "$resp" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    models = [m['id'] for m in data.get('data', [])]
+    print(', '.join(models) if models else '(none)')
+except: print('(parse error)')
+" 2>/dev/null || echo "(parse error)"
+        }
+
         _do_status() {
             local topo
             topo="$(_current_topology)"
+            local port="${SPARK_PORT:-8001}"
+
             _bold "Spark Topology"
             echo "  Current topology: ${topo}"
             echo ""
 
             if [[ "$topo" == "split" ]]; then
-                echo "=== monad (primary) ==="
+                # ── monad ─────────────────────────────────────────────────
+                echo "=== ${SPARK_PRIMARY_HOST:-monad} (primary) ==="
                 if systemctl is-active --quiet spark-vllm-standalone 2>/dev/null; then
                     _green "  spark-vllm-standalone: active"
+                    local _monad_models
+                    _monad_models="$(_query_models localhost "$port")"
+                    echo "  model: ${_monad_models}"
                 else
                     _yellow "  spark-vllm-standalone: inactive"
                 fi
 
                 echo ""
-                echo "=== dyad (secondary) ==="
+
+                # ── dyad ──────────────────────────────────────────────────
+                echo "=== ${_DYAD:-dyad} (secondary) ==="
                 if _ssh_dyad "systemctl is-active --quiet spark-vllm-standalone" 2>/dev/null; then
                     _green "  spark-vllm-standalone: active"
+                    local _dyad_models
+                    _dyad_models="$(_query_models "${_DYAD:-dyad}" "$port")"
+                    echo "  model: ${_dyad_models}"
                 else
                     _yellow "  spark-vllm-standalone: inactive or unreachable"
                 fi
             else
-                echo "=== monad (primary) ==="
+                # ── cluster mode ──────────────────────────────────────────
+                echo "=== ${SPARK_PRIMARY_HOST:-monad} (primary) ==="
                 if systemctl is-active --quiet spark-ray-head 2>/dev/null; then
                     _green "  spark-ray-head: active"
                 else
@@ -445,12 +477,15 @@ case "${1:-}" in
                 fi
                 if systemctl is-active --quiet spark-ray-vllm 2>/dev/null; then
                     _green "  spark-ray-vllm: active"
+                    local _cluster_models
+                    _cluster_models="$(_query_models localhost "$port")"
+                    echo "  model: ${_cluster_models}"
                 else
                     _yellow "  spark-ray-vllm: inactive"
                 fi
 
                 echo ""
-                echo "=== dyad (secondary) ==="
+                echo "=== ${_DYAD:-dyad} (secondary) ==="
                 if _ssh_dyad "systemctl is-active --quiet spark-ray-worker" 2>/dev/null; then
                     _green "  spark-ray-worker: active"
                 else
@@ -459,8 +494,9 @@ case "${1:-}" in
             fi
 
             echo ""
+            # ── proxy ─────────────────────────────────────────────────────
             if systemctl is-active --quiet spark-proxy 2>/dev/null; then
-                _green "spark-proxy: active"
+                _green "spark-proxy: active (port ${SPARK_PROXY_PORT:-9000})"
             else
                 _yellow "spark-proxy: inactive"
             fi
