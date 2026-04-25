@@ -822,6 +822,7 @@ case "${1:-}" in
                     exit 0
                 fi
                 _do_split
+                exit 0
                 ;;
             cluster)
                 if [[ "$_DRY_RUN" == true ]]; then
@@ -844,8 +845,9 @@ case "${1:-}" in
                     exit 0
                 fi
                 _do_cluster
+                exit 0
                 ;;
-            status)  _do_status  ;;
+            status)  _do_status ; exit 0 ;;
         esac
         ;;
 esac
