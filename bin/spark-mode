@@ -371,7 +371,6 @@ case "${1:-}" in
                 -e "s|{{HEAD_IP}}|${_HEAD_IP:-}|g" \
                 -e "s|{{QSFP_IFACE}}|${SPARK_QSFP_IFACE:-enp1s0f0np0}|g" \
                 -e "s|{{RAY_VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
-                -e "s|{{VLLM_IMAGE}}|${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5}|g" \
                 -e "s|{{PORT}}|${SPARK_PORT:-8000}|g" \
                 -e "s|{{UPSTREAM_PORT}}|${SPARK_PORT:-8000}|g" \
                 -e "s|{{PROXY_PORT}}|${SPARK_PROXY_PORT:-9000}|g" \
@@ -477,19 +476,41 @@ case "${1:-}" in
                 spark_die "MODEL_NAME is not set. Check ${_SPARK_CFG}/model.env"
             fi
 
-            # Derive HuggingFace hub cache dir from model name.
+            # ── Resolve per-node models ──────────────────────────────────────
+            # In split mode each node can serve a different model.  model.env
+            # provides the monad model; node.env.dyad may override MODEL_NAME
+            # for dyad.  Detect this so pre-flight checks the right cache on
+            # each node and the summary shows accurate per-node info.
+            local _monad_model="${MODEL_NAME}"
+            local _dyad_model="${MODEL_NAME}"
+            local _dyad_node_env_file="${_SPARK_CFG}/node.env.${_DYAD:-dyad}"
+            if [[ -f "${_dyad_node_env_file}" ]]; then
+                local _override
+                _override="$(grep -m1 '^MODEL_NAME=' "${_dyad_node_env_file}" 2>/dev/null | cut -d= -f2)"
+                if [[ -n "${_override}" ]]; then
+                    _dyad_model="${_override}"
+                fi
+            fi
+
+            local _multi_model=false
+            if [[ "${_monad_model}" != "${_dyad_model}" ]]; then
+                _multi_model=true
+            fi
+
+            # Derive HuggingFace hub cache dirs for each node's model.
             # "Org/ModelName" → "models--Org--ModelName"
-            local cache_dir model_cache
-            cache_dir="models--$(echo "${MODEL_NAME}" | sed 's|/|--|g')"
-            model_cache="${_SPARK_HOME}/.cache/huggingface/hub/${cache_dir}"
+            local _monad_cache _dyad_cache
+            _monad_cache="${_SPARK_HOME}/.cache/huggingface/hub/models--$(echo "${_monad_model}" | sed 's|/|--|g')"
+            _dyad_cache="${_SPARK_HOME}/.cache/huggingface/hub/models--$(echo "${_dyad_model}" | sed 's|/|--|g')"
 
             _HEAD_IP="$(_detect_head_ip)"
 
             echo "Switching to SPLIT mode (two independent vLLM instances, TP=1 per node)..."
+            if [[ "${_multi_model}" == true ]]; then
+                echo "  Multi-model: monad → ${_monad_model}"
+                echo "               dyad  → ${_dyad_model}"
+            fi
             echo ""
-
-            # Auto-resolve port before starting services.
-            spark_resolve_port
 
             # ── [1/12] Pre-flight: SSH connectivity ──────────────────────────
             echo "[1/12] Pre-flight: verifying SSH connectivity to dyad..."
@@ -498,23 +519,41 @@ case "${1:-}" in
             fi
             spark_info "SSH to dyad: OK"
 
-            # ── [2/12] Pre-flight: model cache on dyad ───────────────────────
-            echo "[2/12] Pre-flight: checking model cache on dyad..."
-            if ! _ssh_dyad "test -d '${model_cache}'" 2>/dev/null; then
+            # ── [2/12] Pre-flight: model cache on both nodes ─────────────────
+            echo "[2/12] Pre-flight: checking model caches..."
+            local _preflight_ok=true
+
+            # Check monad's model cache (local)
+            if [[ ! -d "${_monad_cache}" ]]; then
+                echo ""
+                spark_error "Model cache not found on monad at:"
+                echo "  ${_monad_cache}"
+                echo ""
+                echo "Download the model on monad first:"
+                echo "  huggingface-cli download '${_monad_model}'"
+                echo ""
+                _preflight_ok=false
+            else
+                spark_info "monad: ${_monad_model} cache OK"
+            fi
+
+            # Check dyad's model cache (remote — use dyad's model, not monad's)
+            if ! _ssh_dyad "test -d '${_dyad_cache}'" 2>/dev/null; then
                 echo ""
                 spark_error "Model cache not found on dyad at:"
-                echo "  ${model_cache}"
+                echo "  ${_dyad_cache}"
                 echo ""
                 echo "Download the model on dyad first:"
-                echo "  ssh ${_DYAD}"
-                echo "  docker run --rm --gpus all \\"
-                echo "    -v ${_SPARK_HOME}/.cache/huggingface:/root/.cache/huggingface \\"
-                echo "    ${SPARK_RAY_VLLM_IMAGE:-scitrera/dgx-spark-vllm:0.15.1-t5} \\"
-                echo "    huggingface-cli download ${MODEL_NAME}"
+                echo "  ssh ${_DYAD} huggingface-cli download '${_dyad_model}'"
                 echo ""
+                _preflight_ok=false
+            else
+                spark_info "dyad:  ${_dyad_model} cache OK"
+            fi
+
+            if [[ "${_preflight_ok}" != true ]]; then
                 exit 1
             fi
-            spark_info "Model cache found on dyad: OK"
 
             # ── [3/12] Stop cluster services on monad ────────────────────────
             echo "[3/12] Stopping cluster services on monad..."
@@ -535,6 +574,11 @@ case "${1:-}" in
             echo "[5/12] Removing stale containers on both nodes..."
             docker rm -f spark-ray spark-vllm 2>/dev/null || true
             _ssh_dyad "docker rm -f spark-ray spark-vllm 2>/dev/null || true"
+
+            # Now that services and containers are stopped, resolve the port.
+            # Doing this AFTER cleanup avoids needlessly bumping the port when
+            # our own previous vLLM instance was the process holding it.
+            spark_resolve_port
 
             # ── [6/12] Install standalone service on monad ───────────────────
             echo "[6/12] Installing spark-vllm-standalone.service on monad..."
@@ -649,7 +693,12 @@ case "${1:-}" in
             echo "  API (load balanced):  http://${SPARK_PRIMARY_HOST}:${_proxy_port}/v1"
             echo "  API (direct monad):   http://${SPARK_PRIMARY_HOST}:${_direct_port}/v1"
             echo "  API (direct dyad):    http://${_DYAD}:${_direct_port}/v1"
-            echo "  Model:                ${_model}"
+            if [[ "${_multi_model}" == true ]]; then
+                echo "  Model (monad):        ${_monad_model}"
+                echo "  Model (dyad):         ${_dyad_model}"
+            else
+                echo "  Model:                ${_model}"
+            fi
             if [[ -n "${_token}" ]]; then
                 echo "  API key (proxy):      ${_token}"
             fi
@@ -660,7 +709,11 @@ case "${1:-}" in
             if [[ -n "${_token}" ]]; then
                 echo "      --api-key ${_token} \\"
             fi
-            echo "      --model ${_model}"
+            if [[ "${_multi_model}" == true ]]; then
+                echo "      --model ${_monad_model}   # or ${_dyad_model}"
+            else
+                echo "      --model ${_model}"
+            fi
             echo ""
             echo "Run 'spark-mode status' to verify service states."
         }

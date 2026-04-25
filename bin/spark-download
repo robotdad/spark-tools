@@ -499,7 +499,7 @@ for node in "${TARGET_NODES[@]}"; do
             huggingface-cli download '${MODEL}' >> '${LOG_FILE}' 2>&1
             echo \"[spark-download] finished at \$(date) (exit: \$?)\" >> '${LOG_FILE}'
         " </dev/null >/dev/null 2>&1 &
-        local dl_pid=$!
+        dl_pid=$!
 
         echo "  Log: ${LOG_FILE}"
         _green "  Download started (PID ${dl_pid})"

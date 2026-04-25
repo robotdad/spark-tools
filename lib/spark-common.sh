@@ -69,7 +69,8 @@ Run 'spark-init' to create it."
     export SPARK_MODE SPARK_ENGINE SPARK_PRIMARY_HOST SPARK_SECONDARY_HOST
     export SPARK_PORT SPARK_QSFP_IFACE SPARK_TOOLS_DIR
     export MODEL_NAME TP_SIZE MAX_MODEL_LEN GPU_MEM_UTIL
-    export VLLM_EXTRA_ARGS TRTLLM_PORT TRTLLM_MAX_BATCH_SIZE
+    export VLLM_EXTRA_ARGS VLLM_IMAGE VLLM_SERVE_CMD
+    export TRTLLM_PORT TRTLLM_MAX_BATCH_SIZE
     export TRTLLM_MAX_NUM_TOKENS TRTLLM_GPU_MEM_FRACTION
     export SERVED_MODEL_NAME
 }
@@ -103,7 +104,112 @@ spark_load_node_env() {
     fi
 
     # Re-export model-related vars in case node.env changed them
-    export MODEL_NAME TP_SIZE MAX_MODEL_LEN GPU_MEM_UTIL VLLM_EXTRA_ARGS SERVED_MODEL_NAME
+    export MODEL_NAME TP_SIZE MAX_MODEL_LEN GPU_MEM_UTIL
+    export VLLM_EXTRA_ARGS VLLM_IMAGE VLLM_SERVE_CMD SERVED_MODEL_NAME
+}
+
+# --- Model Profile Resolution ---
+# Profiles live in $SPARK_TOOLS_DIR/profiles/ as env files keyed by model name.
+# Model name "Org/Model" maps to file "Org--Model.env" (slashes → double dash).
+#
+# Profiles carry VLLM_IMAGE, VLLM_SERVE_CMD, VLLM_EXTRA_ARGS, and recommended
+# defaults (PROFILE_DEFAULT_*) for TP_SIZE, MAX_MODEL_LEN, GPU_MEM_UTIL.
+#
+# Usage:
+#   spark_resolve_profile "google/gemma-4-26B-A4B-it"
+#     → prints the profile file path and returns 0, or returns 1 if not found
+#
+#   spark_apply_profile "google/gemma-4-26B-A4B-it" /path/to/model.env
+#     → applies VLLM_IMAGE, VLLM_SERVE_CMD, VLLM_EXTRA_ARGS from the profile
+#       to the given model.env file via sed substitution.
+#       Optionally applies PROFILE_DEFAULT_* values if the corresponding
+#       model.env value was not explicitly set by the user (--tp, --ctx, --mem).
+
+SPARK_PROFILES_DIR="${SPARK_TOOLS_DIR}/profiles"
+
+# Resolve a model name to a profile file path.  Returns 0 and prints the
+# path if found, returns 1 if no matching profile exists.
+spark_resolve_profile() {
+    local model_name="$1"
+    local profile_file="${SPARK_PROFILES_DIR}/$(echo "${model_name}" | sed 's|/|--|g').env"
+    if [[ -f "$profile_file" ]]; then
+        echo "$profile_file"
+        return 0
+    fi
+    return 1
+}
+
+# Apply a profile's settings to model.env.
+# Arguments:
+#   $1  model name (HuggingFace repo ID)
+#   $2  path to model.env to update
+#   $3  (optional) "defaults" — also apply PROFILE_DEFAULT_* values
+spark_apply_profile() {
+    local model_name="$1"
+    local model_env="$2"
+    local apply_defaults="${3:-}"
+
+    local profile_file
+    if ! profile_file=$(spark_resolve_profile "$model_name"); then
+        return 1
+    fi
+
+    # Source profile into a subshell to avoid polluting current env
+    local p_vllm_image p_vllm_serve_cmd p_vllm_extra_args
+    local p_default_tp p_default_ctx p_default_mem
+    eval "$(
+        source "$profile_file"
+        echo "p_vllm_image='${VLLM_IMAGE:-}'"
+        echo "p_vllm_serve_cmd='${VLLM_SERVE_CMD:-}'"
+        echo "p_vllm_extra_args='${VLLM_EXTRA_ARGS:-}'"
+        echo "p_default_tp='${PROFILE_DEFAULT_TP_SIZE:-}'"
+        echo "p_default_ctx='${PROFILE_DEFAULT_MAX_MODEL_LEN:-}'"
+        echo "p_default_mem='${PROFILE_DEFAULT_GPU_MEM_UTIL:-}'"
+    )"
+
+    # Apply VLLM_IMAGE
+    if [[ -n "$p_vllm_image" ]]; then
+        if grep -q '^VLLM_IMAGE=' "$model_env"; then
+            sed -i "s|^VLLM_IMAGE=.*|VLLM_IMAGE=${p_vllm_image}|" "$model_env"
+        else
+            echo "VLLM_IMAGE=${p_vllm_image}" >> "$model_env"
+        fi
+    fi
+
+    # Apply VLLM_SERVE_CMD
+    if grep -q '^VLLM_SERVE_CMD=' "$model_env"; then
+        sed -i "s|^VLLM_SERVE_CMD=.*|VLLM_SERVE_CMD=${p_vllm_serve_cmd}|" "$model_env"
+    else
+        echo "VLLM_SERVE_CMD=${p_vllm_serve_cmd}" >> "$model_env"
+    fi
+
+    # Apply VLLM_EXTRA_ARGS
+    if [[ -n "$p_vllm_extra_args" ]]; then
+        sed -i "s|^VLLM_EXTRA_ARGS=.*|VLLM_EXTRA_ARGS=\"${p_vllm_extra_args}\"|" "$model_env"
+    fi
+
+    # Optionally apply recommended defaults
+    if [[ "$apply_defaults" == "defaults" ]]; then
+        [[ -n "$p_default_tp" ]]  && sed -i "s/^TP_SIZE=.*/TP_SIZE=${p_default_tp}/" "$model_env"
+        [[ -n "$p_default_ctx" ]] && sed -i "s/^MAX_MODEL_LEN=.*/MAX_MODEL_LEN=${p_default_ctx}/" "$model_env"
+        [[ -n "$p_default_mem" ]] && sed -i "s/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=${p_default_mem}/" "$model_env"
+    fi
+
+    return 0
+}
+
+# List all available profiles.  Prints "Org/Model" names, one per line.
+spark_list_profiles() {
+    if [[ ! -d "$SPARK_PROFILES_DIR" ]]; then
+        return 0
+    fi
+    local f
+    for f in "${SPARK_PROFILES_DIR}"/*.env; do
+        [[ -f "$f" ]] || continue
+        local basename="${f##*/}"        # "Org--Model.env"
+        basename="${basename%.env}"       # "Org--Model"
+        echo "${basename/--//}"          # "Org/Model"
+    done
 }
 
 # --- Validation ---

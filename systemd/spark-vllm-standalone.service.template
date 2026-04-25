@@ -8,7 +8,7 @@ Type=simple
 User={{USERNAME}}
 WorkingDirectory=/home/{{USERNAME}}
 
-# ── Config load order ─────────────────────────────────────────────────────
+# ── Config load order ─────────────────────────────────────────────
 # cluster.env is NOT loaded here — only model + node overrides.
 # Load order: model.env → node.env  (later file wins on any key it defines)
 # System-level paths are optional (-); user-level paths are authoritative.
@@ -17,14 +17,21 @@ EnvironmentFile=/home/{{USERNAME}}/.config/spark-tools/model.env
 EnvironmentFile=-/etc/spark-tools/node.env
 EnvironmentFile=-/home/{{USERNAME}}/.config/spark-tools/node.env
 
-# ── Pre-start ──────────────────────────────────────────────────────────────
+# ── Pre-start ────────────────────────────────────────────────────
 # Remove any stale container from a previous run.
 ExecStartPre=-/usr/bin/docker rm -f spark-vllm
 # Drop OS page cache to free memory before loading model weights.
 # Requires root; the || true makes it non-fatal when running as a normal user.
 ExecStartPre=/usr/bin/bash -c 'sync && echo 3 > /proc/sys/vm/drop_caches || true'
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────
+# VLLM_IMAGE and VLLM_SERVE_CMD come from model.env (set by spark-set-model
+# via model profiles) and can be overridden per-node in node.env.
+#
+# VLLM_SERVE_CMD controls the entrypoint style:
+#   "vllm serve"  — NGC images (nvidia_entrypoint.sh, need explicit command)
+#   ""            — Docker Hub images (vllm serve is the ENTRYPOINT already)
+#
 # Strip --enforce-eager from VLLM_EXTRA_ARGS at runtime.
 # It is only needed for multi-node TP=2 (Triton allocator crash); standalone
 # is always TP=1 where CUDA graphs work fine and give ~25-30% better throughput.
@@ -39,8 +46,8 @@ ExecStart=/usr/bin/bash -c '\
   -v /etc/encodings:/etc/encodings \
   -e TIKTOKEN_ENCODINGS_BASE=/etc/encodings \
   -e VLLM_FLASHINFER_MOE_BACKEND=latency \
-  {{VLLM_IMAGE}} \
-  vllm serve "$MODEL_NAME" \
+  ${VLLM_IMAGE} \
+  ${VLLM_SERVE_CMD} "$MODEL_NAME" \
     --tensor-parallel-size "$TP_SIZE" \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
